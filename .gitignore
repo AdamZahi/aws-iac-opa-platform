@@ -5,9 +5,3 @@
 *.tfstate.backup
 *.tfvars
 crash.log
-override.tf
-override.tf.json
-
-# OS
-.DS_Store
-Thumbs.db
