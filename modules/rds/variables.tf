@@ -22,7 +22,7 @@ variable "allowed_security_group_ids" {
 
 variable "db_name" {
   type    = string
-  default = "iac-app-db"
+  default = "iacdb"
 }
 
 variable "db_username" {
