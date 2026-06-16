@@ -1,56 +1,50 @@
 AWSTemplateFormatVersion: "2010-09-09"
 Description: >
-  ROOT / NESTED STACK — IaC Comparison Project
-  Orchestrates the network (VPC) and security (Security Groups) nested stacks
-  in a single deployment. Use this as the entry point for the full baseline
-  infrastructure deployment.
+  ROOT STACK — IaC Comparison Project (v2 — Nested Stacks & Cross-References)
 
-  Deploy order enforced by DependsOn: SecurityStack waits for NetworkStack
-  so cross-stack Fn::ImportValue exports are available.
+  DEPLOYMENT ORDER (enforced via DependsOn):
+    1. NetworkStack  (VPC, subnets, IGW, NAT, routes)
+    2. IAMStack      (roles, instance profile, CFN exec role)   [parallel with network]
+    3. SecurityStack (security groups — imports VPC from NetworkStack)
+    4. RegistryStack (SSM Parameter Store registry — consolidates all cross-refs)
+    5. ComputeStack  (ASG — consumes both Fn::ImportValue and SSM resolve refs)
+
+  CROSS-STACK REFERENCE PATTERNS demonstrated:
+    A. Fn::ImportValue  — strict coupling, deploy-time resolution
+    B. SSM resolve      — loose coupling, supports stack teardown/rebuild
+    C. !GetAtt Stack.Outputs.Key — within the root stack, bubble up child outputs
 
 Metadata:
   AWS::CloudFormation::Interface:
     ParameterGroups:
       - Label:
-          default: "Template Storage"
-        Parameters:
-          - TemplatesBucketName
-          - TemplatesPrefix
+          default: "1 — Template Storage (S3)"
+        Parameters: [TemplatesBucketName, TemplatesPrefix]
       - Label:
-          default: "Project Context"
-        Parameters:
-          - ProjectName
-          - Environment
+          default: "2 — Project Context"
+        Parameters: [ProjectName, Environment]
       - Label:
-          default: "Network"
-        Parameters:
-          - VpcCidr
-          - AvailabilityZone1
-          - AvailabilityZone2
-          - EnableNatGateway
-          - SingleNatGateway
+          default: "3 — Network"
+        Parameters: [VpcCidr, AvailabilityZone1, AvailabilityZone2, EnableNatGateway, SingleNatGateway]
       - Label:
-          default: "Security"
-        Parameters:
-          - BastionAllowedCidr
+          default: "4 — Security"
+        Parameters: [BastionAllowedCidr]
+      - Label:
+          default: "5 — Compute"
+        Parameters: [InstanceType, MinCapacity, MaxCapacity, DesiredCapacity, DeployCompute]
 
 Parameters:
-  # ── Template storage ──────────────────────────────────────
+
   TemplatesBucketName:
     Type: String
-    Description: >
-      S3 bucket containing the nested template files (vpc.yaml,
-      security-groups.yaml). Must be in the same AWS region.
+    Description: S3 bucket holding nested template files (same AWS region).
     Default: my-cfn-templates-bucket
 
   TemplatesPrefix:
     Type: String
     Default: "cloudformation/"
-    Description: >
-      S3 key prefix (folder) where templates are stored.
-      Include trailing slash (e.g. "cloudformation/").
+    Description: S3 key prefix (include trailing slash).
 
-  # ── Project context ───────────────────────────────────────
   ProjectName:
     Type: String
     Default: iac-comparison
@@ -61,7 +55,6 @@ Parameters:
     Default: dev
     AllowedValues: [dev, staging, prod]
 
-  # ── Network ───────────────────────────────────────────────
   VpcCidr:
     Type: String
     Default: "10.0.0.0/16"
@@ -84,14 +77,47 @@ Parameters:
     Default: "true"
     AllowedValues: ["true", "false"]
 
-  # ── Security ──────────────────────────────────────────────
   BastionAllowedCidr:
     Type: String
     Default: "0.0.0.0/0"
+    Description: "PRODUCTION: restrict to your corporate egress CIDR."
+
+  InstanceType:
+    Type: String
+    Default: t3.micro
+    AllowedValues: [t3.micro, t3.small, t3.medium, t3.large]
+
+  MinCapacity:
+    Type: Number
+    Default: 1
+
+  MaxCapacity:
+    Type: Number
+    Default: 3
+
+  DesiredCapacity:
+    Type: Number
+    Default: 1
+
+  DeployCompute:
+    Type: String
+    Default: "false"
+    AllowedValues: ["true", "false"]
+    Description: >
+      Set to true to deploy the ComputeStack (ASG). Keep false to deploy
+      only network/IAM/security layers — useful for incremental rollout.
+
+Conditions:
+  ShouldDeployCompute: !Equals [!Ref DeployCompute, "true"]
+
+  # Helper: build the S3 HTTPS base URL once, reused in all TemplateURL values
+  # (CloudFormation doesn't support custom mappings for this, so we use !Sub inline)
 
 Resources:
 
-  # ── Nested: Network stack (VPC, Subnets, IGW, NAT, Routes) ─
+  # ══════════════════════════════════════════════════════════════
+  # LAYER 1 — NETWORK  (no dependencies)
+  # ══════════════════════════════════════════════════════════════
   NetworkStack:
     Type: AWS::CloudFormation::Stack
     Properties:
@@ -103,8 +129,8 @@ Resources:
         ProjectName: !Ref ProjectName
         Environment: !Ref Environment
         VpcCidr: !Ref VpcCidr
-        PublicSubnet1Cidr: !Select [0, !Cidr [!Ref VpcCidr, 16, 8]]   # 10.0.0.0/24
-        PublicSubnet2Cidr: !Select [1, !Cidr [!Ref VpcCidr, 16, 8]]
+        PublicSubnet1Cidr:  !Select [0,  !Cidr [!Ref VpcCidr, 16, 8]]
+        PublicSubnet2Cidr:  !Select [1,  !Cidr [!Ref VpcCidr, 16, 8]]
         PrivateSubnet1Cidr: !Select [10, !Cidr [!Ref VpcCidr, 16, 8]]
         PrivateSubnet2Cidr: !Select [11, !Cidr [!Ref VpcCidr, 16, 8]]
         AvailabilityZone1: !Ref AvailabilityZone1
@@ -116,8 +142,34 @@ Resources:
           Value: !Ref ProjectName
         - Key: Environment
           Value: !Ref Environment
+        - Key: Layer
+          Value: network
 
-  # ── Nested: Security Groups stack ──────────────────────────
+  # ══════════════════════════════════════════════════════════════
+  # LAYER 1 — IAM  (no dependencies — runs in parallel with NetworkStack)
+  # ══════════════════════════════════════════════════════════════
+  IAMStack:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: !Sub
+        - "https://${Bucket}.s3.${AWS::Region}.amazonaws.com/${Prefix}iam/roles.yaml"
+        - Bucket: !Ref TemplatesBucketName
+          Prefix: !Ref TemplatesPrefix
+      Parameters:
+        ProjectName: !Ref ProjectName
+        Environment: !Ref Environment
+        AllowS3Access: "false"
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Layer
+          Value: iam
+
+  # ══════════════════════════════════════════════════════════════
+  # LAYER 2 — SECURITY  (depends on NetworkStack for VPC exports)
+  # ══════════════════════════════════════════════════════════════
   SecurityStack:
     Type: AWS::CloudFormation::Stack
     DependsOn: NetworkStack
@@ -136,24 +188,104 @@ Resources:
           Value: !Ref ProjectName
         - Key: Environment
           Value: !Ref Environment
+        - Key: Layer
+          Value: security
 
+  # ══════════════════════════════════════════════════════════════
+  # LAYER 3 — SSM REGISTRY  (depends on all Layer 1+2 stacks)
+  # Consolidates every cross-stack value into SSM for loose coupling.
+  # ══════════════════════════════════════════════════════════════
+  RegistryStack:
+    Type: AWS::CloudFormation::Stack
+    DependsOn:
+      - IAMStack
+    Properties:
+      TemplateURL: !Sub
+        - "https://${Bucket}.s3.${AWS::Region}.amazonaws.com/${Prefix}parameters/ssm-registry.yaml"
+        - Bucket: !Ref TemplatesBucketName
+          Prefix: !Ref TemplatesPrefix
+      Parameters:
+        ProjectName: !Ref ProjectName
+        Environment: !Ref Environment
+        # ── Values bubbled up from child stacks via !GetAtt ──
+        VpcId:           !GetAtt NetworkStack.Outputs.VpcId
+        VpcCidr:         !GetAtt NetworkStack.Outputs.VpcCidr
+        PublicSubnet1Id: !GetAtt NetworkStack.Outputs.PublicSubnet1Id
+        PublicSubnet2Id: !GetAtt NetworkStack.Outputs.PublicSubnet2Id
+        PrivateSubnet1Id: !GetAtt NetworkStack.Outputs.PrivateSubnet1Id
+        PrivateSubnet2Id: !GetAtt NetworkStack.Outputs.PrivateSubnet2Id
+        BastionSgId:     !GetAtt SecurityStack.Outputs.BastionSecurityGroupId
+        WebSgId:         !GetAtt SecurityStack.Outputs.WebSecurityGroupId
+        AppSgId:         !GetAtt SecurityStack.Outputs.AppSecurityGroupId
+        DbSgId:          !GetAtt SecurityStack.Outputs.DatabaseSecurityGroupId
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Layer
+          Value: registry
+
+  # ══════════════════════════════════════════════════════════════
+  # LAYER 4 — COMPUTE  (optional, toggled by DeployCompute param)
+  # Depends on RegistryStack (SSM params must exist before resolve runs)
+  # ══════════════════════════════════════════════════════════════
+  ComputeStack:
+    Type: AWS::CloudFormation::Stack
+    Condition: ShouldDeployCompute
+    DependsOn: RegistryStack
+    Properties:
+      TemplateURL: !Sub
+        - "https://${Bucket}.s3.${AWS::Region}.amazonaws.com/${Prefix}compute/app-asg.yaml"
+        - Bucket: !Ref TemplatesBucketName
+          Prefix: !Ref TemplatesPrefix
+      Parameters:
+        ProjectName: !Ref ProjectName
+        Environment: !Ref Environment
+        InstanceType: !Ref InstanceType
+        MinCapacity: !Ref MinCapacity
+        MaxCapacity: !Ref MaxCapacity
+        DesiredCapacity: !Ref DesiredCapacity
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Layer
+          Value: compute
+
+# ══════════════════════════════════════════════════════════════
+# OUTPUTS — surface the most-consumed values at root level
+# ══════════════════════════════════════════════════════════════
 Outputs:
+
+  # ── Network ──────────────────────────────────────────────────
   VpcId:
-    Description: VPC ID (from NetworkStack)
+    Description: VPC ID
     Value: !GetAtt NetworkStack.Outputs.VpcId
 
   PublicSubnetIds:
-    Description: Public Subnet IDs
+    Description: Public Subnet IDs (comma-separated)
     Value: !GetAtt NetworkStack.Outputs.PublicSubnetIds
 
   PrivateSubnetIds:
-    Description: Private Subnet IDs
+    Description: Private Subnet IDs (comma-separated)
     Value: !GetAtt NetworkStack.Outputs.PrivateSubnetIds
 
-  BastionSgId:
-    Description: Bastion Security Group ID
-    Value: !GetAtt SecurityStack.Outputs.BastionSecurityGroupId
+  # ── IAM ──────────────────────────────────────────────────────
+  EC2InstanceProfileArn:
+    Description: EC2 Instance Profile ARN
+    Value: !GetAtt IAMStack.Outputs.EC2InstanceProfileArn
 
+  CICDDeployRoleArn:
+    Description: CI/CD deployment role ARN (configure in GitHub Actions)
+    Value: !GetAtt IAMStack.Outputs.CICDDeployRoleArn
+
+  CFNExecutionRoleArn:
+    Description: CloudFormation execution role ARN
+    Value: !GetAtt IAMStack.Outputs.CFNExecutionRoleArn
+
+  # ── Security ─────────────────────────────────────────────────
   WebSgId:
     Description: Web/ALB Security Group ID
     Value: !GetAtt SecurityStack.Outputs.WebSecurityGroupId
@@ -165,3 +297,20 @@ Outputs:
   DbSgId:
     Description: Database Security Group ID
     Value: !GetAtt SecurityStack.Outputs.DatabaseSecurityGroupId
+
+  # ── Registry ─────────────────────────────────────────────────
+  SSMRegistryNamespace:
+    Description: >
+      SSM Parameter Store namespace. Use {{resolve:ssm:<namespace><key>}}
+      in any template to avoid Fn::ImportValue coupling.
+    Value: !GetAtt RegistryStack.Outputs.RegistryNamespace
+
+  SSMResolveExample:
+    Description: Example SSM resolve snippet for VPC ID
+    Value: !GetAtt RegistryStack.Outputs.SampleResolveSnippet
+
+  # ── Compute (conditional) ─────────────────────────────────────
+  ASGName:
+    Description: Auto Scaling Group name (only present when DeployCompute=true)
+    Condition: ShouldDeployCompute
+    Value: !GetAtt ComputeStack.Outputs.AutoScalingGroupName
