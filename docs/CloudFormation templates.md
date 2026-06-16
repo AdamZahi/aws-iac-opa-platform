@@ -26,12 +26,12 @@ cloudformation/
 # Configure AWS credentials first
 export AWS_PROFILE=my-profile
 
-# Deploy to dev (eu-west-1 by default)
+# Deploy to dev (eu-west-2 by default)
 chmod +x deploy.sh
-./deploy.sh dev eu-west-1
+./deploy.sh dev eu-west-2
 
 # Deploy to prod
-./deploy.sh prod eu-west-1
+./deploy.sh prod eu-west-2
 ```
 
 ---
@@ -100,8 +100,8 @@ CFN's `DetectStackDrift` is built-in and reports per-resource property-level cha
 | `PublicSubnet2Cidr` | `10.0.2.0/24` | Public subnet, AZ2 |
 | `PrivateSubnet1Cidr` | `10.0.10.0/24` | Private subnet, AZ1 |
 | `PrivateSubnet2Cidr` | `10.0.11.0/24` | Private subnet, AZ2 |
-| `AvailabilityZone1` | `eu-west-1a` | First AZ |
-| `AvailabilityZone2` | `eu-west-1b` | Second AZ |
+| `AvailabilityZone1` | `eu-west-2a` | First AZ |
+| `AvailabilityZone2` | `eu-west-2b` | Second AZ |
 | `EnableNatGateway` | `true` | `false` skips NAT GW (saves cost in dev) |
 | `SingleNatGateway` | `true` | `false` deploys one NAT GW per AZ for HA |
 
