@@ -1,0 +1,205 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  COMPUTE NESTED STACK — IaC Comparison Project
+  EC2 Launch Template and Auto Scaling Group.
+
+  PURPOSE IN THIS TICKET: demonstrates both cross-stack reference patterns
+  in a real consumer stack:
+    1. Fn::ImportValue  — reads VpcId, SubnetIds, SgIds exported by network/security stacks
+    2. {{resolve:ssm}} — reads IAM profile ARN published via SSM by iam/roles.yaml
+
+  This mirrors how a Terraform root module wires child module outputs together.
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: iac-comparison
+
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, staging, prod]
+
+  # ── Instance config ───────────────────────────────────────
+  InstanceType:
+    Type: String
+    Default: t3.micro
+    AllowedValues: [t3.micro, t3.small, t3.medium, t3.large]
+    Description: EC2 instance type for the Auto Scaling Group.
+
+  AmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64
+    Description: >
+      SSM public parameter path for the latest Amazon Linux 2023 AMI.
+      This is an AWS-managed path — no manual AMI ID management needed.
+
+  MinCapacity:
+    Type: Number
+    Default: 1
+    MinValue: 0
+
+  MaxCapacity:
+    Type: Number
+    Default: 3
+    MinValue: 1
+
+  DesiredCapacity:
+    Type: Number
+    Default: 1
+
+  # ── Cross-stack resolution method ─────────────────────────
+  # Kept as a parameter so OPA/Conftest can inspect and test both paths.
+    Description: >
+      When true: VPC/subnet/SG values are resolved via SSM dynamic references.
+      When false: Fn::ImportValue is used. Both produce identical infrastructure;
+      this toggle exists purely for the CFN vs Terraform comparison exercise.
+
+Conditions:
+  IsProd: !Equals [!Ref Environment, "prod"]
+
+Resources:
+
+  # ── Launch Template ─────────────────────────────────────────
+  # Single source of truth for instance configuration.
+  # ASG and any spot fleet reference this template by version.
+  AppLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateName: !Sub "${ProjectName}-${Environment}-app-lt"
+      LaunchTemplateData:
+        ImageId: !Ref AmiId
+        InstanceType: !Ref InstanceType
+
+        # ── Cross-stack ref pattern 2: SSM dynamic resolve ──
+        # The IAM instance profile ARN was published to SSM by iam/roles.yaml.
+        # No Fn::ImportValue needed — the SSM path is the contract.
+        IamInstanceProfile:
+          Arn: !Sub "{{resolve:ssm:/${ProjectName}/${Environment}/iam/ec2-instance-profile-arn}}"
+
+        # ── Cross-stack ref pattern 1: Fn::ImportValue ───────
+        # Security group imported directly from the security stack export.
+        SecurityGroupIds:
+          - Fn::ImportValue: !Sub "${ProjectName}-${Environment}-AppSgId"
+
+        # IMDSv2 enforced — blocks SSRF-based metadata attacks
+        MetadataOptions:
+          HttpTokens: required
+          HttpPutResponseHopLimit: 1
+          HttpEndpoint: enabled
+
+        # Block device: encrypted root volume, no public snapshots
+        BlockDeviceMappings:
+          - DeviceName: /dev/xvda
+            Ebs:
+              VolumeSize: 20
+              VolumeType: gp3
+              Encrypted: true
+              DeleteOnTermination: true
+
+        UserData:
+          Fn::Base64: !Sub |
+            #!/bin/bash
+            set -euo pipefail
+            # Install CloudWatch agent
+            yum install -y amazon-cloudwatch-agent
+            # Signal CFN that the instance is ready
+            /opt/aws/bin/cfn-signal -e $? \
+              --stack ${AWS::StackName} \
+              --resource AppAutoScalingGroup \
+              --region ${AWS::Region}
+
+        TagSpecifications:
+          - ResourceType: instance
+            Tags:
+              - Key: Name
+                Value: !Sub "${ProjectName}-${Environment}-app"
+              - Key: Project
+                Value: !Ref ProjectName
+              - Key: Environment
+                Value: !Ref Environment
+              - Key: ManagedBy
+                Value: CloudFormation
+          - ResourceType: volume
+            Tags:
+              - Key: Project
+                Value: !Ref ProjectName
+              - Key: Environment
+                Value: !Ref Environment
+
+  # ── Auto Scaling Group ───────────────────────────────────────
+  AppAutoScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    CreationPolicy:
+      ResourceSignal:
+        Count: !Ref DesiredCapacity
+        Timeout: PT10M
+    UpdatePolicy:
+      AutoScalingRollingUpdate:
+        MinInstancesInService: !If [IsProd, 1, 0]
+        MaxBatchSize: 1
+        PauseTime: PT5M
+        WaitOnResourceSignals: true
+    Properties:
+      AutoScalingGroupName: !Sub "${ProjectName}-${Environment}-app-asg"
+      MinSize: !Ref MinCapacity
+      MaxSize: !Ref MaxCapacity
+      DesiredCapacity: !Ref DesiredCapacity
+
+      # ── Cross-stack ref: private subnets (both patterns shown) ─
+      # Pattern A — Fn::ImportValue (resolved at deploy time, strict coupling)
+      VPCZoneIdentifier:
+        - Fn::ImportValue: !Sub "${ProjectName}-${Environment}-PrivateSubnet1Id"
+        - Fn::ImportValue: !Sub "${ProjectName}-${Environment}-PrivateSubnet2Id"
+
+      LaunchTemplate:
+        LaunchTemplateId: !Ref AppLaunchTemplate
+        Version: !GetAtt AppLaunchTemplate.LatestVersionNumber
+
+      HealthCheckType: EC2
+      HealthCheckGracePeriod: 120
+
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-${Environment}-app"
+          PropagateAtLaunch: true
+        - Key: Project
+          Value: !Ref ProjectName
+          PropagateAtLaunch: true
+        - Key: Environment
+          Value: !Ref Environment
+          PropagateAtLaunch: true
+        - Key: ManagedBy
+          Value: CloudFormation
+          PropagateAtLaunch: true
+
+  # ── CPU Scaling Policy ───────────────────────────────────────
+  CPUScalingPolicy:
+    Type: AWS::AutoScaling::ScalingPolicy
+    Properties:
+      AutoScalingGroupName: !Ref AppAutoScalingGroup
+      PolicyType: TargetTrackingScaling
+      TargetTrackingConfiguration:
+        PredefinedMetricSpecification:
+          PredefinedMetricType: ASGAverageCPUUtilization
+        TargetValue: 70.0
+
+Outputs:
+  LaunchTemplateId:
+    Description: App Launch Template ID
+    Value: !Ref AppLaunchTemplate
+    Export:
+      Name: !Sub "${ProjectName}-${Environment}-AppLaunchTemplateId"
+
+  AutoScalingGroupName:
+    Description: App Auto Scaling Group Name
+    Value: !Ref AppAutoScalingGroup
+    Export:
+      Name: !Sub "${ProjectName}-${Environment}-AppASGName"
+
+  CrossRefPatternNote:
+    Description: >
+      This stack demonstrates both CFN cross-stack reference patterns.
+      SecurityGroupId uses Fn::ImportValue (strict, deploy-time coupling).
+      IamInstanceProfile ARN uses SSM resolve (loose, runtime coupling).
+    Value: "See LaunchTemplate resource for inline comments."

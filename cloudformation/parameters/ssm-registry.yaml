@@ -1,0 +1,226 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: "SSM PARAMETER STORE REGISTRY — IaC Comparison Project. Publishes all cross-stack reference values into SSM Parameter Store."
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Project Context"
+        Parameters: [ProjectName, Environment]
+      - Label:
+          default: "Values from Network Stack (paste from CFN outputs)"
+        Parameters: [VpcId, VpcCidr, PublicSubnet1Id, PublicSubnet2Id, PrivateSubnet1Id, PrivateSubnet2Id]
+      - Label:
+          default: "Values from Security Stack"
+        Parameters: [BastionSgId, WebSgId, AppSgId, DbSgId]
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: iac-comparison
+
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, staging, prod]
+
+  # ── Network values ────────────────────────────────────────
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: VPC ID from the network stack output.
+
+  VpcCidr:
+    Type: String
+    Description: VPC CIDR block.
+    AllowedPattern: "^(\\d{1,3}\\.){3}\\d{1,3}/\\d{1,2}$"
+
+  PublicSubnet1Id:
+    Type: AWS::EC2::Subnet::Id
+
+  PublicSubnet2Id:
+    Type: AWS::EC2::Subnet::Id
+
+  PrivateSubnet1Id:
+    Type: AWS::EC2::Subnet::Id
+
+  PrivateSubnet2Id:
+    Type: AWS::EC2::Subnet::Id
+
+  # ── Security Group values ─────────────────────────────────
+  BastionSgId:
+    Type: AWS::EC2::SecurityGroup::Id
+
+  WebSgId:
+    Type: AWS::EC2::SecurityGroup::Id
+
+  AppSgId:
+    Type: AWS::EC2::SecurityGroup::Id
+
+  DbSgId:
+    Type: AWS::EC2::SecurityGroup::Id
+
+Resources:
+
+  # ═══════════════════════════════════════════════════════════
+  # NETWORK PARAMETERS
+  # ═══════════════════════════════════════════════════════════
+
+  ParamVpcId:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub "/${ProjectName}/${Environment}/network/vpc-id"
+      Type: String
+      Value: !Ref VpcId
+      Description: VPC ID — used by all compute and database stacks
+      Tags:
+        Project: !Ref ProjectName
+        Environment: !Ref Environment
+        Layer: network
+
+  ParamVpcCidr:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub "/${ProjectName}/${Environment}/network/vpc-cidr"
+      Type: String
+      Value: !Ref VpcCidr
+      Description: VPC CIDR — used for security group egress scoping
+      Tags:
+        Project: !Ref ProjectName
+        Environment: !Ref Environment
+        Layer: network
+
+  ParamPublicSubnet1:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub "/${ProjectName}/${Environment}/network/public-subnet-1-id"
+      Type: String
+      Value: !Ref PublicSubnet1Id
+      Description: Public Subnet AZ1 — for ALB and bastion placement
+      Tags:
+        Project: !Ref ProjectName
+        Environment: !Ref Environment
+        Layer: network
+
+  ParamPublicSubnet2:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub "/${ProjectName}/${Environment}/network/public-subnet-2-id"
+      Type: String
+      Value: !Ref PublicSubnet2Id
+      Description: Public Subnet AZ2 — for ALB and bastion placement
+      Tags:
+        Project: !Ref ProjectName
+        Environment: !Ref Environment
+        Layer: network
+
+  ParamPrivateSubnet1:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub "/${ProjectName}/${Environment}/network/private-subnet-1-id"
+      Type: String
+      Value: !Ref PrivateSubnet1Id
+      Description: Private Subnet AZ1 — for EC2/EKS and RDS placement
+      Tags:
+        Project: !Ref ProjectName
+        Environment: !Ref Environment
+        Layer: network
+
+  ParamPrivateSubnet2:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub "/${ProjectName}/${Environment}/network/private-subnet-2-id"
+      Type: String
+      Value: !Ref PrivateSubnet2Id
+      Description: Private Subnet AZ2 — for EC2/EKS and RDS placement
+      Tags:
+        Project: !Ref ProjectName
+        Environment: !Ref Environment
+        Layer: network
+
+  # Derived: comma-separated lists for services that accept StringList
+  ParamPublicSubnetList:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub "/${ProjectName}/${Environment}/network/public-subnet-ids"
+      Type: StringList
+      Value: !Sub "${PublicSubnet1Id},${PublicSubnet2Id}"
+      Description: "Comma-separated public subnet IDs"
+      Tags:
+        Project: !Ref ProjectName
+        Environment: !Ref Environment
+        Layer: network
+
+  ParamPrivateSubnetList:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub "/${ProjectName}/${Environment}/network/private-subnet-ids"
+      Type: StringList
+      Value: !Sub "${PrivateSubnet1Id},${PrivateSubnet2Id}"
+      Description: "Comma-separated private subnet IDs"
+      Tags:
+        Project: !Ref ProjectName
+        Environment: !Ref Environment
+        Layer: network
+
+  # ═══════════════════════════════════════════════════════════
+  # SECURITY GROUP PARAMETERS
+  # ═══════════════════════════════════════════════════════════
+
+  ParamBastionSg:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub "/${ProjectName}/${Environment}/security/bastion-sg-id"
+      Type: String
+      Value: !Ref BastionSgId
+      Description: Bastion host security group ID
+      Tags:
+        Project: !Ref ProjectName
+        Environment: !Ref Environment
+        Layer: security
+
+  ParamWebSg:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub "/${ProjectName}/${Environment}/security/web-sg-id"
+      Type: String
+      Value: !Ref WebSgId
+      Description: Web/ALB security group ID
+      Tags:
+        Project: !Ref ProjectName
+        Environment: !Ref Environment
+        Layer: security
+
+  ParamAppSg:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub "/${ProjectName}/${Environment}/security/app-sg-id"
+      Type: String
+      Value: !Ref AppSgId
+      Description: Application tier security group ID
+      Tags:
+        Project: !Ref ProjectName
+        Environment: !Ref Environment
+        Layer: security
+
+  ParamDbSg:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub "/${ProjectName}/${Environment}/network/db-sg-id"
+      Type: String
+      Value: !Ref DbSgId
+      Description: Database security group ID
+      Tags:
+        Project: !Ref ProjectName
+        Environment: !Ref Environment
+        Layer: security
+
+Outputs:
+  RegistryNamespace:
+    Description: SSM namespace root for all cross-stack references
+    Value: !Sub "/${ProjectName}/${Environment}/"
+
+  SampleResolveSnippet:
+    Description: >
+      Example of how a downstream template resolves a value without
+      any Fn::ImportValue dependency.
+    Value: !Sub "{{resolve:ssm:/${ProjectName}/${Environment}/network/vpc-id}}"
