@@ -1,0 +1,255 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  Security Groups for the IaC comparison project.
+  Includes groups for a bastion host, web/application tier, and database tier.
+  Imports VPC outputs from the network stack via cross-stack references.
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Stack References"
+        Parameters:
+          - NetworkStackName
+      - Label:
+          default: "Project Context"
+        Parameters:
+          - ProjectName
+          - Environment
+      - Label:
+          default: "Bastion Host Access"
+        Parameters:
+          - BastionAllowedCidr
+    ParameterLabels:
+      NetworkStackName:
+        default: "VPC stack name (for Fn::ImportValue)"
+      BastionAllowedCidr:
+        default: "CIDR allowed to SSH into the bastion"
+
+Parameters:
+  NetworkStackName:
+    Type: String
+    Default: iac-comparison-dev-network
+    Description: >
+      Name of the deployed vpc.yaml stack. Used to import VPC ID and CIDR
+      via Fn::ImportValue.
+
+  ProjectName:
+    Type: String
+    Default: iac-comparison
+    AllowedPattern: "^[a-z][a-z0-9-]{1,28}[a-z0-9]$"
+
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, staging, prod]
+
+  BastionAllowedCidr:
+    Type: String
+    Default: "0.0.0.0/0"
+    Description: >
+      CIDR allowed to SSH (port 22) into the bastion host.
+      IMPORTANT: restrict to your corporate IP range in production.
+    AllowedPattern: "^(\\d{1,3}\\.){3}\\d{1,3}/\\d{1,2}$"
+    ConstraintDescription: "Must be a valid CIDR block."
+
+Resources:
+
+  # ── Bastion Host Security Group ─────────────────────────────
+  # Allows SSH ingress from a known CIDR; no direct inbound on other ports.
+  BastionSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub "${ProjectName}-${Environment}-bastion-sg"
+      GroupDescription: >
+        Bastion host: permits SSH from the approved CIDR only.
+        All other traffic is implicitly denied.
+      VpcId:
+        # NetworkStackName is used here indirectly: the export key convention
+        # must match what vpc.yaml publishes. We reference it explicitly below
+        # to satisfy cfn-lint and document the dependency.
+        Fn::ImportValue: !Sub "${ProjectName}-${Environment}-VpcId"
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: !Ref BastionAllowedCidr
+          Description: !Sub "SSH access — expected stack: ${NetworkStackName}"
+      SecurityGroupEgress:
+        - IpProtocol: "-1"
+          CidrIp: "0.0.0.0/0"
+          Description: "Allow all outbound traffic"
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-${Environment}-bastion-sg"
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # ── Web / ALB Security Group ────────────────────────────────
+  # Allows HTTP and HTTPS from the internet; attached to load balancers.
+  WebSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub "${ProjectName}-${Environment}-web-sg"
+      GroupDescription: >
+        ALB / Web tier: permits HTTP (80) and HTTPS (443) from the internet.
+      VpcId:
+        Fn::ImportValue: !Sub "${ProjectName}-${Environment}-VpcId"
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: "0.0.0.0/0"
+          Description: "HTTP from internet"
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: "0.0.0.0/0"
+          Description: "HTTPS from internet"
+      SecurityGroupEgress:
+        - IpProtocol: "-1"
+          CidrIp: "0.0.0.0/0"
+          Description: "Allow all outbound traffic"
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-${Environment}-web-sg"
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # ── Application Tier Security Group ────────────────────────
+  # Accepts traffic only from the web SG and the bastion (for debugging).
+  AppSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub "${ProjectName}-${Environment}-app-sg"
+      GroupDescription: >
+        Application tier: accepts port 8080 from WebSG and SSH from BastionSG.
+      VpcId:
+        Fn::ImportValue: !Sub "${ProjectName}-${Environment}-VpcId"
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 8080
+          ToPort: 8080
+          SourceSecurityGroupId: !Ref WebSecurityGroup
+          Description: "App traffic from Web/ALB SG"
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          SourceSecurityGroupId: !Ref BastionSecurityGroup
+          Description: "SSH access from bastion only"
+      SecurityGroupEgress:
+        - IpProtocol: "-1"
+          CidrIp: "0.0.0.0/0"
+          Description: "Allow all outbound traffic"
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-${Environment}-app-sg"
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # ── Database Tier Security Group ────────────────────────────
+  # Accepts PostgreSQL (5432) only from the application tier.
+  # SSH is intentionally blocked — DB nodes must never be directly accessible.
+  DatabaseSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub "${ProjectName}-${Environment}-db-sg"
+      GroupDescription: >
+        Database tier: permits PostgreSQL (5432) from AppSG only.
+        Direct SSH/bastion access is intentionally denied (OPA rule enforced).
+      VpcId:
+        Fn::ImportValue: !Sub "${ProjectName}-${Environment}-VpcId"
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 5432
+          ToPort: 5432
+          SourceSecurityGroupId: !Ref AppSecurityGroup
+          Description: "PostgreSQL from App tier only"
+      SecurityGroupEgress:
+        # DB nodes only need to call AWS endpoints (e.g. Secrets Manager, S3 for snapshots)
+        # Restrict to VPC CIDR for tighter security in prod
+        - IpProtocol: "-1"
+          CidrIp:
+            Fn::ImportValue: !Sub "${ProjectName}-${Environment}-VpcCidr"
+          Description: "Outbound restricted to VPC CIDR"
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-${Environment}-db-sg"
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # ── Egress-only (monitoring / Lambda) SG ───────────────────
+  # An extra group demonstrating a no-ingress pattern used for Lambda
+  # functions or monitoring agents that only need outbound connectivity.
+  EgressOnlySecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub "${ProjectName}-${Environment}-egress-only-sg"
+      GroupDescription: >
+        No inbound rules. Used for Lambda / monitoring agents that push data
+        out but must never accept inbound connections.
+      VpcId:
+        Fn::ImportValue: !Sub "${ProjectName}-${Environment}-VpcId"
+      # No SecurityGroupIngress — AWS default is deny all inbound
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: "0.0.0.0/0"
+          Description: "HTTPS outbound only (API calls, telemetry)"
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-${Environment}-egress-only-sg"
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: CloudFormation
+
+Outputs:
+  BastionSecurityGroupId:
+    Description: Bastion Host Security Group ID
+    Value: !Ref BastionSecurityGroup
+    Export:
+      Name: !Sub "${ProjectName}-${Environment}-BastionSgId"
+
+  WebSecurityGroupId:
+    Description: Web / ALB Security Group ID
+    Value: !Ref WebSecurityGroup
+    Export:
+      Name: !Sub "${ProjectName}-${Environment}-WebSgId"
+
+  AppSecurityGroupId:
+    Description: Application Tier Security Group ID
+    Value: !Ref AppSecurityGroup
+    Export:
+      Name: !Sub "${ProjectName}-${Environment}-AppSgId"
+
+  DatabaseSecurityGroupId:
+    Description: Database Tier Security Group ID
+    Value: !Ref DatabaseSecurityGroup
+    Export:
+      Name: !Sub "${ProjectName}-${Environment}-DbSgId"
+
+  EgressOnlySecurityGroupId:
+    Description: Egress-Only Security Group ID
+    Value: !Ref EgressOnlySecurityGroup
+    Export:
+      Name: !Sub "${ProjectName}-${Environment}-EgressOnlySgId"

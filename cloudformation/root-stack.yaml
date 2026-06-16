@@ -1,0 +1,167 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  ROOT / NESTED STACK — IaC Comparison Project
+  Orchestrates the network (VPC) and security (Security Groups) nested stacks
+  in a single deployment. Use this as the entry point for the full baseline
+  infrastructure deployment.
+
+  Deploy order enforced by DependsOn: SecurityStack waits for NetworkStack
+  so cross-stack Fn::ImportValue exports are available.
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Template Storage"
+        Parameters:
+          - TemplatesBucketName
+          - TemplatesPrefix
+      - Label:
+          default: "Project Context"
+        Parameters:
+          - ProjectName
+          - Environment
+      - Label:
+          default: "Network"
+        Parameters:
+          - VpcCidr
+          - AvailabilityZone1
+          - AvailabilityZone2
+          - EnableNatGateway
+          - SingleNatGateway
+      - Label:
+          default: "Security"
+        Parameters:
+          - BastionAllowedCidr
+
+Parameters:
+  # ── Template storage ──────────────────────────────────────
+  TemplatesBucketName:
+    Type: String
+    Description: >
+      S3 bucket containing the nested template files (vpc.yaml,
+      security-groups.yaml). Must be in the same AWS region.
+    Default: my-cfn-templates-bucket
+
+  TemplatesPrefix:
+    Type: String
+    Default: "cloudformation/"
+    Description: >
+      S3 key prefix (folder) where templates are stored.
+      Include trailing slash (e.g. "cloudformation/").
+
+  # ── Project context ───────────────────────────────────────
+  ProjectName:
+    Type: String
+    Default: iac-comparison
+    AllowedPattern: "^[a-z][a-z0-9-]{1,28}[a-z0-9]$"
+
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, staging, prod]
+
+  # ── Network ───────────────────────────────────────────────
+  VpcCidr:
+    Type: String
+    Default: "10.0.0.0/16"
+
+  AvailabilityZone1:
+    Type: AWS::EC2::AvailabilityZone::Name
+    Default: eu-west-2a
+
+  AvailabilityZone2:
+    Type: AWS::EC2::AvailabilityZone::Name
+    Default: eu-west-2b
+
+  EnableNatGateway:
+    Type: String
+    Default: "true"
+    AllowedValues: ["true", "false"]
+
+  SingleNatGateway:
+    Type: String
+    Default: "true"
+    AllowedValues: ["true", "false"]
+
+  # ── Security ──────────────────────────────────────────────
+  BastionAllowedCidr:
+    Type: String
+    Default: "0.0.0.0/0"
+
+Resources:
+
+  # ── Nested: Network stack (VPC, Subnets, IGW, NAT, Routes) ─
+  NetworkStack:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: !Sub
+        - "https://${Bucket}.s3.${AWS::Region}.amazonaws.com/${Prefix}network/vpc.yaml"
+        - Bucket: !Ref TemplatesBucketName
+          Prefix: !Ref TemplatesPrefix
+      Parameters:
+        ProjectName: !Ref ProjectName
+        Environment: !Ref Environment
+        VpcCidr: !Ref VpcCidr
+        PublicSubnet1Cidr: !Select [0, !Cidr [!Ref VpcCidr, 16, 8]]   # 10.0.0.0/24
+        PublicSubnet2Cidr: !Select [1, !Cidr [!Ref VpcCidr, 16, 8]]
+        PrivateSubnet1Cidr: !Select [10, !Cidr [!Ref VpcCidr, 16, 8]]
+        PrivateSubnet2Cidr: !Select [11, !Cidr [!Ref VpcCidr, 16, 8]]
+        AvailabilityZone1: !Ref AvailabilityZone1
+        AvailabilityZone2: !Ref AvailabilityZone2
+        EnableNatGateway: !Ref EnableNatGateway
+        SingleNatGateway: !Ref SingleNatGateway
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ── Nested: Security Groups stack ──────────────────────────
+  SecurityStack:
+    Type: AWS::CloudFormation::Stack
+    DependsOn: NetworkStack
+    Properties:
+      TemplateURL: !Sub
+        - "https://${Bucket}.s3.${AWS::Region}.amazonaws.com/${Prefix}security/security-groups.yaml"
+        - Bucket: !Ref TemplatesBucketName
+          Prefix: !Ref TemplatesPrefix
+      Parameters:
+        ProjectName: !Ref ProjectName
+        Environment: !Ref Environment
+        NetworkStackName: !Sub "${ProjectName}-${Environment}-network"
+        BastionAllowedCidr: !Ref BastionAllowedCidr
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+Outputs:
+  VpcId:
+    Description: VPC ID (from NetworkStack)
+    Value: !GetAtt NetworkStack.Outputs.VpcId
+
+  PublicSubnetIds:
+    Description: Public Subnet IDs
+    Value: !GetAtt NetworkStack.Outputs.PublicSubnetIds
+
+  PrivateSubnetIds:
+    Description: Private Subnet IDs
+    Value: !GetAtt NetworkStack.Outputs.PrivateSubnetIds
+
+  BastionSgId:
+    Description: Bastion Security Group ID
+    Value: !GetAtt SecurityStack.Outputs.BastionSecurityGroupId
+
+  WebSgId:
+    Description: Web/ALB Security Group ID
+    Value: !GetAtt SecurityStack.Outputs.WebSecurityGroupId
+
+  AppSgId:
+    Description: App Tier Security Group ID
+    Value: !GetAtt SecurityStack.Outputs.AppSecurityGroupId
+
+  DbSgId:
+    Description: Database Security Group ID
+    Value: !GetAtt SecurityStack.Outputs.DatabaseSecurityGroupId
