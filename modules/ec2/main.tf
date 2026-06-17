@@ -1,26 +1,62 @@
-# Security Group
+# SSM VPC Endpoints (required for private subnets with no internet access)
+resource "aws_vpc_endpoint" "ssm" {
+  vpc_id              = var.vpc_id
+  service_name        = "com.amazonaws.eu-west-2.ssm"
+  vpc_endpoint_type   = "Interface"
+  subnet_ids          = [var.subnet_id]
+  security_group_ids  = [aws_security_group.ec2.id]
+  private_dns_enabled = true
+
+  tags = {
+    Name        = "${var.project_name}-${var.environment}-ssm-endpoint"
+    Environment = var.environment
+    ManagedBy   = "terraform"
+  }
+}
+
+resource "aws_vpc_endpoint" "ssmmessages" {
+  vpc_id              = var.vpc_id
+  service_name        = "com.amazonaws.eu-west-2.ssmmessages"
+  vpc_endpoint_type   = "Interface"
+  subnet_ids          = [var.subnet_id]
+  security_group_ids  = [aws_security_group.ec2.id]
+  private_dns_enabled = true
+
+  tags = {
+    Name        = "${var.project_name}-${var.environment}-ssmmessages-endpoint"
+    Environment = var.environment
+    ManagedBy   = "terraform"
+  }
+}
+
+resource "aws_vpc_endpoint" "ec2messages" {
+  vpc_id              = var.vpc_id
+  service_name        = "com.amazonaws.eu-west-2.ec2messages"
+  vpc_endpoint_type   = "Interface"
+  subnet_ids          = [var.subnet_id]
+  security_group_ids  = [aws_security_group.ec2.id]
+  private_dns_enabled = true
+
+  tags = {
+    Name        = "${var.project_name}-${var.environment}-ec2messages-endpoint"
+    Environment = var.environment
+    ManagedBy   = "terraform"
+  }
+}
+
+# Update security group — add HTTPS egress for SSM endpoints
 resource "aws_security_group" "ec2" {
   name        = "${var.project_name}-${var.environment}-ec2-sg"
   description = "Security group for EC2 instance"
   vpc_id      = var.vpc_id
 
-  # SSH — only opened if allowed_ssh_cidrs is explicitly set
-  dynamic "ingress" {
-    for_each = length(var.allowed_ssh_cidrs) > 0 ? [1] : []
-    content {
-      description = "SSH access"
-      from_port   = 22
-      to_port     = 22
-      protocol    = "tcp"
-      cidr_blocks = var.allowed_ssh_cidrs
-    }
-  }
+  # No SSH ingress — access via SSM Session Manager only
 
   egress {
-    description = "Allow all outbound"
-    from_port   = 0
-    to_port     = 0
-    protocol    = "-1"
+    description = "HTTPS for SSM endpoints"
+    from_port   = 443
+    to_port     = 443
+    protocol    = "tcp"
     cidr_blocks = ["0.0.0.0/0"]
   }
 
@@ -31,16 +67,12 @@ resource "aws_security_group" "ec2" {
   }
 }
 
-# EC2 Instance
 resource "aws_instance" "main" {
-  ami                    = var.ami_id
-  instance_type          = var.instance_type
-  subnet_id              = var.subnet_id
-  vpc_security_group_ids = [aws_security_group.ec2.id]
-  iam_instance_profile   = var.iam_instance_profile
-  user_data              = var.user_data
-
-  # Block public IP — instance lives in private subnet
+  ami                         = var.ami_id
+  instance_type               = var.instance_type
+  subnet_id                   = var.subnet_id
+  vpc_security_group_ids      = [aws_security_group.ec2.id]
+  iam_instance_profile        = var.iam_instance_profile  # SSM profile attached here
   associate_public_ip_address = false
 
   root_block_device {
@@ -50,7 +82,7 @@ resource "aws_instance" "main" {
   }
 
   metadata_options {
-    http_tokens = "required" # Enforce IMDSv2
+    http_tokens = "required" # IMDSv2
   }
 
   tags = {
