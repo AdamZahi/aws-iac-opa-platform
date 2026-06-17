@@ -1,3 +1,9 @@
+module "iam" {
+  source       = "../../modules/iam"
+  project_name = var.project_name
+  environment  = var.environment
+}
+
 module "vpc" {
   source               = "../../modules/vpc"
   project_name         = var.project_name
@@ -10,12 +16,13 @@ module "vpc" {
 }
 
 module "ec2" {
-  source        = "../../modules/ec2"
-  project_name  = var.project_name
-  environment   = var.environment
-  vpc_id        = module.vpc.vpc_id
-  subnet_id     = module.vpc.private_subnet_ids[0]
-  instance_type = var.ec2_instance_type
+  source               = "../../modules/ec2"
+  project_name         = var.project_name
+  environment          = var.environment
+  vpc_id               = module.vpc.vpc_id
+  subnet_id            = module.vpc.private_subnet_ids[0]
+  instance_type        = var.ec2_instance_type
+  iam_instance_profile = module.iam.instance_profile_name  # 👈 SSM access
 }
 
 module "rds" {
