@@ -1,0 +1,152 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  Backend Stack - Terraform remote state storage (equivalent to backend/s3.tf
+  and backend/dynamodb.tf). Deploy this ONCE before running any Terraform commands.
+
+# PARAMETERS
+Parameters:
+
+  # The S3 bucket name for Terraform state
+  StateBucketName:
+    Type: String
+    Default: terraform-iac-project-state
+    Description: >
+      S3 bucket name for Terraform state files.
+      MUST be globally unique - if it already exists you'll get an error.
+      Consider adding your AWS account ID: e.g. terraform-iac-project-state-123456789
+
+  # The DynamoDB table name for state locking
+  LockTableName:
+    Type: String
+    Default: terraform-locks
+    Description: DynamoDB table name for Terraform state locking
+
+  ProjectName:
+    Type: String
+    Default: terraform-iac-project
+    Description: Project name for resource tagging
+
+Resources:
+  # S3 BUCKET  (equivalent to: resource "aws_s3_bucket" "terraform_state")
+  # Stores the Terraform state file (terraform.tfstate)
+  TerraformStateBucket:
+    Type: AWS::S3::Bucket
+    # DeletionPolicy: Retain = keep the bucket even if you delete this stack.
+    # This is intentional! Losing your state file would be catastrophic.
+    DeletionPolicy: Retain
+    Properties:
+      BucketName: !Ref StateBucketName
+
+      # Enable versioning so you can recover old state files if something goes wrong
+      # (equivalent to: resource "aws_s3_bucket_versioning" "terraform_state")
+      VersioningConfiguration:
+        Status: Enabled
+
+      # Encrypt all state files at rest
+      # (equivalent to: resource "aws_s3_bucket_server_side_encryption_configuration")
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256   # AWS-managed encryption key (free)
+
+      # IMPORTANT: Block all public access to the state bucket.
+      # State files can contain secrets - never make them public!
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+      Tags:
+        - Key: Name
+          Value: !Ref StateBucketName
+        - Key: Purpose
+          Value: Terraform state storage
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # Bucket policy: deny any unencrypted uploads to the state bucket
+  TerraformStateBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref TerraformStateBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: DenyUnencryptedUploads
+            Effect: Deny
+            Principal: "*"
+            Action: s3:PutObject
+            Resource: !Sub "${TerraformStateBucket.Arn}/*"
+            Condition:
+              StringNotEquals:
+                s3:x-amz-server-side-encryption: AES256
+
+          # Deny any access over HTTP (require HTTPS)
+          - Sid: DenyHTTP
+            Effect: Deny
+            Principal: "*"
+            Action: s3:*
+            Resource:
+              - !GetAtt TerraformStateBucket.Arn
+              - !Sub "${TerraformStateBucket.Arn}/*"
+            Condition:
+              Bool:
+                aws:SecureTransport: false
+
+  TerraformLockTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain   # Keep the table even if this stack is deleted
+    Properties:
+      TableName: !Ref LockTableName
+      BillingMode: PAY_PER_REQUEST
+
+      # The primary key MUST be "LockID" (String) - Terraform requires this exact name
+      AttributeDefinitions:
+        - AttributeName: LockID
+          AttributeType: S
+
+      KeySchema:
+        - AttributeName: LockID
+          KeyType: HASH
+
+      Tags:
+        - Key: Name
+          Value: !Ref LockTableName
+        - Key: Purpose
+          Value: Terraform state locking
+        - Key: Project
+          Value: !Ref ProjectName
+
+
+# OUTPUTS
+Outputs:
+  StateBucketName:
+    Description: >
+      S3 bucket name for Terraform state.
+      Use this in environments/dev/backend.tf: bucket = "<this value>"
+    Value: !Ref TerraformStateBucket
+
+  StateBucketArn:
+    Description: ARN of the S3 state bucket
+    Value: !GetAtt TerraformStateBucket.Arn
+
+  LockTableName:
+    Description: >
+      DynamoDB table name for state locking.
+      Use this in environments/dev/backend.tf: dynamodb_table = "<this value>"
+    Value: !Ref TerraformLockTable
+
+  BackendConfigHint:
+    Description: >
+      Copy this into environments/dev/backend.tf to connect Terraform to this backend.
+    Value: !Sub |
+      terraform {
+        backend "s3" {
+          bucket         = "${TerraformStateBucket}"
+          key            = "dev/terraform.tfstate"
+          region         = "${AWS::Region}"
+          dynamodb_table = "${TerraformLockTable}"
+          encrypt        = true
+        }
+      }

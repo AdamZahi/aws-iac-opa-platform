@@ -1,0 +1,132 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  EC2 Stack - Web server compute layer (equivalent to Terraform ec2 module).
+  Deploys a security group and EC2 instance into the VPC created by vpc.yaml.
+
+Parameters:
+
+  ProjectName:
+    Type: String
+    Default: terraform-iac-project
+    Description: Must match the ProjectName used in the VPC stack
+
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, staging, prod]
+    Description: Must match the Environment used in the VPC stack
+
+  InstanceType:
+    Type: String
+    Default: t3.micro
+    AllowedValues: [t3.micro, t3.small, t3.medium, t2.micro]
+    Description: "EC2 instance size. t3.micro is AWS Free Tier eligible."
+
+  AmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64
+    Description: >
+      EC2 AMI ID. The default uses AWS SSM to automatically get the latest
+      Amazon Linux 2023 AMI for your region. You can also paste an AMI ID directly.
+
+  KeyName:
+    Type: AWS::EC2::KeyPair::KeyName
+    Description: >
+      Name of an existing EC2 key pair for SSH access.
+      Create one in the AWS Console under EC2 > Key Pairs if needed.
+
+Resources:
+
+  EC2SecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub "${ProjectName}-${Environment}-ec2-sg"
+      GroupDescription: "Security group for EC2 web server"
+      VpcId:
+        Fn::ImportValue: !Sub "${ProjectName}-${Environment}-VpcId"
+
+      # INBOUND RULES - what traffic is allowed IN
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: "0.0.0.0/0"
+          Description: "Allow HTTP from anywhere"
+
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: "0.0.0.0/0"
+          Description: "Allow HTTPS from anywhere"
+
+        # Allow SSH from anywhere (port 22)
+        # NOTE: In production, restrict this to my IP: e.g. "203.0.113.0/32"
+        # This matches the OPA policy check in policies/ssh_open.rego
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: "0.0.0.0/0"
+          Description: "Allow SSH - restrict to your IP in production!"
+
+      # OUTBOUND RULES - what traffic is allowed OUT
+      SecurityGroupEgress:
+        - IpProtocol: -1        # -1 means "all protocols"
+          CidrIp: "0.0.0.0/0"
+          Description: "Allow all outbound traffic"
+
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-${Environment}-ec2-sg"
+        - Key: Environment
+          Value: !Ref Environment
+
+  EC2Instance:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: !Ref InstanceType
+      ImageId: !Ref AmiId
+      KeyName: !Ref KeyName
+      SubnetId:
+        Fn::ImportValue: !Sub "${ProjectName}-${Environment}-PublicSubnet1Id"
+      SecurityGroupIds:
+        - !Ref EC2SecurityGroup
+      UserData:
+        Fn::Base64: |
+          #!/bin/bash
+          # Update the system
+          yum update -y
+          # Install Apache web server
+          yum install -y httpd
+          # Start Apache and enable it on boot
+          systemctl start httpd
+          systemctl enable httpd
+          # Create a simple test page
+          echo "<h1>Hello from CloudFormation EC2!</h1>" > /var/www/html/index.html
+
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-${Environment}-web-server"
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+Outputs:
+
+  InstanceId:
+    Description: The EC2 instance ID
+    Value: !Ref EC2Instance
+    Export:
+      Name: !Sub "${ProjectName}-${Environment}-InstanceId"
+
+  PublicIp:
+    Description: The public IP address to SSH into or visit in a browser
+    Value: !GetAtt EC2Instance.PublicIp
+    Export:
+      Name: !Sub "${ProjectName}-${Environment}-PublicIp"
+
+  SecurityGroupId:
+    Description: The EC2 security group ID (used by RDS to allow connections from EC2)
+    Value: !Ref EC2SecurityGroup
+    Export:
+      Name: !Sub "${ProjectName}-${Environment}-EC2SecurityGroupId"

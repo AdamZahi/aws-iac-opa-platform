@@ -1,115 +1,128 @@
-# CloudFormation Templates — Basic Infrastructure
+# CloudFormation Templates
 
-> **Epic: Templates CloudFormation Management**  
-> **Ticket: Create CloudFormation templates for basic infrastructure**  
-> US: VPCs, subnets, and security groups — mirroring the Terraform modules for direct comparison.
-
----
-
-## Repository Structure
-
-```
-cloudformation/
-├── root-stack.yaml              # Entry point — orchestrates nested stacks
-├── deploy.sh                    # Upload to S3 + deploy script
-├── network/
-│   └── vpc.yaml                 # VPC, subnets, IGW, NAT GW, route tables
-└── security/
-    └── security-groups.yaml     # Bastion, Web, App, DB, Egress-only SGs
-```
+> **Note:** These templates exist for **learning and comparison purposes only**.
+> In production, we use Terraform exclusively. These templates mirror the same
+> infrastructure that the Terraform modules provision, so you can compare the
+> two approaches side by side.
 
 ---
 
-## Quick Start
+## What's Here
+
+| File | Terraform Equivalent | What it Creates |
+|------|----------------------|-----------------|
+| `backend.yaml` | `backend/s3.tf` + `backend/dynamodb.tf` | S3 bucket for Terraform state + DynamoDB lock table |
+| `vpc.yaml` | `modules/vpc/` | VPC, public/private subnets, Internet Gateway, route tables |
+| `ec2.yaml` | `modules/ec2/` | Security Group + EC2 web server instance |
+| `rds.yaml` | `modules/rds/` | DB Subnet Group, Security Group + MySQL RDS instance |
+
+---
+
+## Architecture
+
+```
+Internet
+    │
+    ▼
+Internet Gateway
+    │
+    ├── Public Subnet 1 (AZ-1) ──► EC2 Instance (web server)
+    └── Public Subnet 2 (AZ-2)
+
+    ├── Private Subnet 1 (AZ-1) ──► RDS Instance (MySQL)
+    └── Private Subnet 2 (AZ-2)     (only EC2 can connect to it)
+```
+
+---
+
+## Deployment Order
+
+> **CloudFormation stacks depend on each other via cross-stack references.**
+> You MUST deploy them in this order:
+
+### Step 1 — Backend (optional, only needed for Terraform)
+```bash
+aws cloudformation deploy \
+  --template-file backend.yaml \
+  --stack-name terraform-iac-backend \
+  --region eu-west-2
+```
+
+### Step 2 — VPC (must be first)
+```bash
+aws cloudformation deploy \
+  --template-file vpc.yaml \
+  --stack-name terraform-iac-project-dev-vpc \
+  --region eu-west-2
+```
+
+### Step 3 — EC2 (needs VPC outputs)
+```bash
+aws cloudformation deploy \
+  --template-file ec2.yaml \
+  --stack-name terraform-iac-project-dev-ec2 \
+  --parameter-overrides KeyName=your-key-pair-name \
+  --region eu-west-2
+```
+
+### Step 4 — RDS (needs VPC + EC2 outputs)
+```bash
+aws cloudformation deploy \
+  --template-file rds.yaml \
+  --stack-name terraform-iac-project-dev-rds \
+  --parameter-overrides DBPassword=YourSecurePassword123 \
+  --region eu-west-2
+```
+
+---
+
+## How Cross-Stack References Work
+
+Terraform modules share values via `outputs.tf` + `variables.tf`.
+CloudFormation does the same with **Exports** and **ImportValue**.
+
+**In vpc.yaml (exporting):**
+```yaml
+Outputs:
+  VpcId:
+    Value: !Ref VPC
+    Export:
+      Name: terraform-iac-project-dev-VpcId   # Published name
+```
+
+**In ec2.yaml (importing):**
+```yaml
+VpcId:
+  Fn::ImportValue: terraform-iac-project-dev-VpcId   # Reads the exported value
+```
+
+This is exactly like Terraform's `module.vpc.vpc_id` output reference.
+
+---
+
+## Terraform vs CloudFormation Comparison
+
+| Concept | Terraform | CloudFormation |
+|---------|-----------|----------------|
+| Template file | `.tf` files | `.yaml` / `.json` files |
+| Resource block | `resource "aws_vpc" "main" {}` | `Type: AWS::EC2::VPC` |
+| Variables | `variable "name" {}` | `Parameters:` section |
+| Outputs | `output "vpc_id" {}` | `Outputs:` + `Export:` |
+| Cross-module refs | `module.vpc.vpc_id` | `Fn::ImportValue` |
+| Deploy command | `terraform apply` | `aws cloudformation deploy` |
+| State file | `terraform.tfstate` (in S3) | Managed by AWS automatically |
+| Destroy | `terraform destroy` | `aws cloudformation delete-stack` |
+
+---
+
+## Cleanup
+
+Delete stacks in **reverse order** (RDS → EC2 → VPC → Backend):
 
 ```bash
-# Configure AWS credentials first
-export AWS_PROFILE=my-profile
-
-# Deploy to dev (eu-west-2 by default)
-chmod +x deploy.sh
-./deploy.sh dev eu-west-2
-
-# Deploy to prod
-./deploy.sh prod eu-west-2
+aws cloudformation delete-stack --stack-name terraform-iac-project-dev-rds   --region eu-west-2
+aws cloudformation delete-stack --stack-name terraform-iac-project-dev-ec2   --region eu-west-2
+aws cloudformation delete-stack --stack-name terraform-iac-project-dev-vpc   --region eu-west-2
+# Backend uses DeletionPolicy: Retain, so deleting the stack won't delete the S3/DynamoDB resources
+aws cloudformation delete-stack --stack-name terraform-iac-backend            --region eu-west-2
 ```
-
----
-
-## Architecture Deployed
-
-```
-VPC (10.0.0.0/16)
-├── Public Subnet AZ1 (10.0.0.0/24)  ──┐
-├── Public Subnet AZ2 (10.0.1.0/24)  ──┼── Internet Gateway → Internet
-│                                        │    NAT Gateway (AZ1)
-├── Private Subnet AZ1 (10.0.10.0/24) ──┘ (routes via NAT)
-└── Private Subnet AZ2 (10.0.11.0/24) ── (routes via NAT or NAT2)
-
-Security Groups (layered, source-SG references):
-  Internet → [WebSG] → [AppSG] → [DbSG]
-  [BastionSG] → [AppSG]   (SSH for debugging only)
-  [EgressOnlySG]           (Lambda / monitoring agents)
-```
-
----
-
-## CFN vs Terraform — Direct Comparison
-
-| Concept | CloudFormation | Terraform |
-|---|---|---|
-| **Variables / inputs** | `Parameters` block | `variable {}` blocks |
-| **Conditional resources** | `Conditions` + `!If` | `count` or `for_each` with ternary |
-| **Cross-stack references** | `Fn::ImportValue` (export by name) | `terraform_remote_state` or module outputs |
-| **Tagging** | `Tags` list on each resource | `default_tags` in provider + per-resource |
-| **String interpolation** | `!Sub "${Var}-suffix"` | `"${var.name}-suffix"` |
-| **Output reuse in same stack** | `!GetAtt Resource.Attr` / `!Ref` | `resource.type.name.attribute` |
-| **Loops** | No native loop (use nested stacks or macros) | `for_each`, `count`, `dynamic` |
-| **State management** | Managed by AWS (no S3 bucket needed) | Requires S3 + DynamoDB backend |
-| **Plan / dry-run** | Change Sets (`aws cloudformation create-change-set`) | `terraform plan` |
-| **Drift detection** | Built-in: `DetectStackDrift` API | `terraform plan` shows drift |
-| **Module reuse** | Nested stacks (TemplateURL in S3) | `module {}` blocks |
-| **Secret injection** | `{{resolve:ssm-secure:/path}}` | `data "aws_secretsmanager_secret"` |
-
-### Key Behavioural Differences
-
-**State**  
-CloudFormation state lives entirely inside AWS — no S3 bucket to provision. Terraform requires the S3 + DynamoDB backend configured in US 1.1.
-
-**Loops and dynamic resources**  
-Terraform's `for_each` makes it trivial to create N subnets from a list. In CloudFormation you enumerate each resource (PublicSubnet1, PublicSubnet2, …) or use CloudFormation Macros / transforms, which adds complexity.
-
-**Cross-stack references**  
-CFN `Fn::ImportValue` is stricter than Terraform remote state — you cannot delete a stack that exports a value being imported elsewhere. This prevents accidental breakage but makes refactoring harder.
-
-**Drift detection**  
-CFN's `DetectStackDrift` is built-in and reports per-resource property-level changes. Terraform drift is revealed on next `plan` and requires running it proactively (hence the drift-detection Lambda in US 3.2).
-
----
-
-## Parameters Reference
-
-### `network/vpc.yaml`
-
-| Parameter | Default | Description |
-|---|---|---|
-| `ProjectName` | `iac-comparison` | Prefix for all resource names |
-| `Environment` | `dev` | `dev \| staging \| prod` |
-| `VpcCidr` | `10.0.0.0/16` | VPC CIDR |
-| `PublicSubnet1Cidr` | `10.0.1.0/24` | Public subnet, AZ1 |
-| `PublicSubnet2Cidr` | `10.0.2.0/24` | Public subnet, AZ2 |
-| `PrivateSubnet1Cidr` | `10.0.10.0/24` | Private subnet, AZ1 |
-| `PrivateSubnet2Cidr` | `10.0.11.0/24` | Private subnet, AZ2 |
-| `AvailabilityZone1` | `eu-west-2a` | First AZ |
-| `AvailabilityZone2` | `eu-west-2b` | Second AZ |
-| `EnableNatGateway` | `true` | `false` skips NAT GW (saves cost in dev) |
-| `SingleNatGateway` | `true` | `false` deploys one NAT GW per AZ for HA |
-
-### `security/security-groups.yaml`
-
-| Parameter | Default | Description |
-|---|---|---|
-| `NetworkStackName` | `iac-comparison-dev-network` | Source stack for `Fn::ImportValue` |
-| `ProjectName` | `iac-comparison` | Must match VPC stack |
-| `Environment` | `dev` | Must match VPC stack |
-| `BastionAllowedCidr` | `0.0.0.0/0` | **Restrict in prod** to corporate IP range |

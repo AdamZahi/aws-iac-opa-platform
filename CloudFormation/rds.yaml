@@ -1,0 +1,166 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  RDS Stack - Database layer (equivalent to Terraform rds module).
+  Deploys a MySQL RDS instance in the private subnets.
+  Only accessible from the EC2 instance (not from the internet).
+
+Parameters:
+
+  ProjectName:
+    Type: String
+    Default: terraform-iac-project
+    Description: Must match the ProjectName used in the VPC and EC2 stacks
+
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, staging, prod]
+    Description: Must match the Environment used in the VPC and EC2 stacks
+
+  DBEngine:
+    Type: String
+    Default: mysql
+    AllowedValues: [mysql, postgres]
+    Description: Database engine type
+
+  DBEngineVersion:
+    Type: String
+    Default: "8.0"
+    Description: "Database engine version (8.0 for MySQL 8)"
+
+  DBInstanceClass:
+    Type: String
+    Default: db.t3.micro
+    AllowedValues: [db.t3.micro, db.t3.small, db.t3.medium]
+    Description: "RDS instance size. db.t3.micro is the smallest (for dev)."
+
+  DBAllocatedStorage:
+    Type: Number
+    Default: 20
+    MinValue: 20
+    MaxValue: 100
+    Description: "Database storage in GB (20 GB minimum for dev)"
+
+  # Database name (same as var.db_name in Terraform)
+  DBName:
+    Type: String
+    Default: appdb
+    Description: "Name of the initial database to create"
+
+  DBUsername:
+    Type: String
+    Default: admin
+    NoEcho: false
+    Description: "Database administrator username"
+
+  DBPassword:
+    Type: String
+    NoEcho: true
+    MinLength: 8
+    Description: "Database administrator password (min 8 characters). This will be hidden."
+
+Resources:
+
+  DBSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupName: !Sub "${ProjectName}-${Environment}-db-subnet-group"
+      DBSubnetGroupDescription: "Private subnets for RDS (no internet access)"
+      SubnetIds:
+        # Import private subnet IDs from the VPC stack
+        - Fn::ImportValue: !Sub "${ProjectName}-${Environment}-PrivateSubnet1Id"
+        - Fn::ImportValue: !Sub "${ProjectName}-${Environment}-PrivateSubnet2Id"
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-${Environment}-db-subnet-group"
+        - Key: Environment
+          Value: !Ref Environment
+
+  RDSSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub "${ProjectName}-${Environment}-rds-sg"
+      GroupDescription: "Security group for RDS - only allows traffic from EC2"
+      VpcId:
+        Fn::ImportValue: !Sub "${ProjectName}-${Environment}-VpcId"
+
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 3306
+          ToPort: 3306
+          SourceSecurityGroupId:
+            Fn::ImportValue: !Sub "${ProjectName}-${Environment}-EC2SecurityGroupId"
+          Description: "Allow MySQL only from EC2 security group"
+
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: "127.0.0.1/32"   # Effectively blocks all outbound traffic
+          Description: "Block all outbound (databases don't need outbound access)"
+
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-${Environment}-rds-sg"
+        - Key: Environment
+          Value: !Ref Environment
+
+  RDSInstance:
+    Type: AWS::RDS::DBInstance
+    DeletionPolicy: Delete
+    Properties:
+      DBInstanceIdentifier: !Sub "${ProjectName}-${Environment}-db"
+      DBName: !Ref DBName
+
+      Engine: !Ref DBEngine
+      EngineVersion: !Ref DBEngineVersion
+
+      DBInstanceClass: !Ref DBInstanceClass
+      AllocatedStorage: !Ref DBAllocatedStorage
+      StorageType: gp2
+      StorageEncrypted: true
+
+      MasterUsername: !Ref DBUsername
+      MasterUserPassword: !Ref DBPassword
+
+      DBSubnetGroupName: !Ref DBSubnetGroup
+      VPCSecurityGroups:
+        - !Ref RDSSecurityGroup
+      PubliclyAccessible: false
+
+      BackupRetentionPeriod: 7
+      PreferredBackupWindow: "03:00-04:00"
+      PreferredMaintenanceWindow: "sun:04:00-sun:05:00"
+
+      MultiAZ: false
+
+      DeletionProtection: false
+
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-${Environment}-rds"
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+
+Outputs:
+
+  DBEndpoint:
+    Description: >
+      The database connection endpoint (hostname).
+      Use this in your app's database connection string.
+    Value: !GetAtt RDSInstance.Endpoint.Address
+    Export:
+      Name: !Sub "${ProjectName}-${Environment}-DBEndpoint"
+
+  DBPort:
+    Description: The port the database listens on (3306 for MySQL)
+    Value: !GetAtt RDSInstance.Endpoint.Port
+    Export:
+      Name: !Sub "${ProjectName}-${Environment}-DBPort"
+
+  DBInstanceId:
+    Description: The RDS instance identifier
+    Value: !Ref RDSInstance
+    Export:
+      Name: !Sub "${ProjectName}-${Environment}-DBInstanceId"
