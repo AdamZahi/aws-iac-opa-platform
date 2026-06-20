@@ -1,0 +1,46 @@
+name: "Setup Terraform & AWS"
+description: >
+  Composite action that installs a pinned Terraform version and
+  configures AWS credentials. Used by all three CI/CD workflows so
+  the setup logic lives in exactly one place.
+
+inputs:
+  terraform-version:
+    description: "Terraform version to install"
+    required: true
+  aws-access-key-id:
+    description: "AWS Access Key ID"
+    required: true
+  aws-secret-access-key:
+    description: "AWS Secret Access Key"
+    required: true
+  aws-region:
+    description: "AWS Region"
+    required: true
+  lock-timeout:
+    description: "DynamoDB state-lock timeout (e.g. 60s)"
+    required: false
+    default: "60s"
+
+runs:
+  using: "composite"
+  steps:
+    - name: Setup Terraform ${{ inputs.terraform-version }}
+      uses: hashicorp/setup-terraform@v3
+      with:
+        terraform_version: ${{ inputs.terraform-version }}
+        terraform_wrapper: true       # Preserves exit codes for plan / apply
+
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        aws-access-key-id:     ${{ inputs.aws-access-key-id }}
+        aws-secret-access-key: ${{ inputs.aws-secret-access-key }}
+        aws-region:            ${{ inputs.aws-region }}
+
+    - name: Terraform Init
+      shell: bash
+      working-directory: environments/dev
+      run: terraform init -input=false
+      env:
+        TF_CLI_ARGS_init: "-lock-timeout=${{ inputs.lock-timeout }}"
