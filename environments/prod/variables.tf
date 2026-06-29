@@ -5,7 +5,7 @@ variable "aws_region" {
 
 variable "project_name" {
   type    = string
-  default = "smartovate"
+  default = "adam-zahi"
 }
 
 variable "environment" {
