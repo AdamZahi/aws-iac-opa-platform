@@ -1,0 +1,272 @@
+name: "4 · Infrastructure Tests"
+
+# Integration tests run only after a successful merge to main —
+on:
+  pull_request:
+    branches:
+      - main
+    paths:
+      - "modules/**"
+      - "environments/**"
+      - "policies/**"
+      - "tests/**"
+
+  push:
+    branches:
+      - main
+    paths:
+      - "modules/**"
+      - "environments/**"
+      - "policies/**"
+      - "tests/**"
+
+# ── Shared constants ────────────────────────────────────────────
+env:
+  GO_VERSION:       "1.22"
+  CONFTEST_VERSION: "0.63.0"
+  TF_VERSION:       "1.9.8"
+
+# Prevent concurrent test runs from competing for the same state lock (Bug 1)
+concurrency:
+  group: infra-tests-${{ github.ref }}
+  cancel-in-progress: true
+
+# ════════════════════════════════════════════════════════════════
+# JOB 1 — Unit tests (plan-only, no AWS credentials needed)
+# Covers: TC-VPC-01..06, TC-EC2-01..05, TC-RDS-01..05
+# ════════════════════════════════════════════════════════════════
+jobs:
+  unit-tests:
+    name: "🧪 Unit Tests (plan-only)"
+    runs-on: ubuntu-latest
+
+    # Unit tests run on PRs AND pushes
+    if: always()
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # ── Language runtimes ──────────────────────────────────────
+      - name: Setup Go ${{ env.GO_VERSION }}
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache-dependency-path: tests/go.sum
+
+      - name: Setup Terraform ${{ env.TF_VERSION }}
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false   # Unit tests call terraform directly via Terratest
+
+      # Fake AWS credentials — plan-only tests need them to initialise the provider
+      # but never make real API calls
+      - name: Set mock AWS credentials
+        run: |
+          echo "AWS_ACCESS_KEY_ID=mock"         >> $GITHUB_ENV
+          echo "AWS_SECRET_ACCESS_KEY=mock"      >> $GITHUB_ENV
+          echo "AWS_DEFAULT_REGION=eu-west-2"    >> $GITHUB_ENV
+
+      # ── Dependencies ───────────────────────────────────────────
+      - name: Download Go modules
+        working-directory: tests
+        run: go mod download
+
+      # ── VPC module unit tests ──────────────────────────────────
+      - name: Run VPC unit tests
+        working-directory: tests
+        run: |
+          go test -v -timeout 10m \
+            -run TestVpc \
+            ./unit/... 2>&1 | tee vpc_test_results.txt
+
+      # ── EC2 module unit tests ──────────────────────────────────
+      - name: Run EC2 unit tests
+        working-directory: tests
+        run: |
+          go test -v -timeout 10m \
+            -run TestEc2 \
+            ./unit/... 2>&1 | tee ec2_test_results.txt
+
+      # ── RDS module unit tests ──────────────────────────────────
+      - name: Run RDS unit tests
+        working-directory: tests
+        run: |
+          go test -v -timeout 10m \
+            -run TestRds \
+            ./unit/... 2>&1 | tee rds_test_results.txt
+
+      # ── Upload results ─────────────────────────────────────────
+      - name: Upload unit test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: unit-test-results-${{ github.sha }}
+          retention-days: 14
+          path: tests/*_test_results.txt
+
+  # JOB 2 — OPA policy regression tests
+  # Covers: TC-OPA-01..07 (including Bug 2 false-positive guard)
+  opa-regression-tests:
+    name: "🔐 OPA Policy Regression Tests"
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Go ${{ env.GO_VERSION }}
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache-dependency-path: tests/go.sum
+
+      - name: Install Conftest ${{ env.CONFTEST_VERSION }}
+        run: |
+          wget -q https://github.com/open-policy-agent/conftest/releases/download/v${{ env.CONFTEST_VERSION }}/conftest_${{ env.CONFTEST_VERSION }}_Linux_x86_64.tar.gz
+          tar xzf conftest_${{ env.CONFTEST_VERSION }}_Linux_x86_64.tar.gz
+          sudo mv conftest /usr/local/bin/
+
+      - name: Download Go modules
+        working-directory: tests
+        run: go mod download
+
+      - name: Run OPA policy regression tests
+        working-directory: tests
+        run: |
+          go test -v -timeout 5m \
+            -run TestOpa \
+            ./unit/... 2>&1 | tee opa_test_results.txt
+
+      - name: Upload OPA test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: opa-test-results-${{ github.sha }}
+          retention-days: 14
+          path: tests/opa_test_results.txt
+
+  # JOB 3 — Integration tests (deploy real AWS resources)
+  # Runs only on push to main (after validate + apply succeed).
+  # Uses a dedicated test environment that is always destroyed.
+  integration-tests:
+    name: "Integration Tests (real AWS)"
+    runs-on: ubuntu-latest
+    needs: [unit-tests, opa-regression-tests]
+
+    # Only run integration tests on push to main — NOT on PRs
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    #environment: integration   # Separate GitHub environment with its own secrets
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Go ${{ env.GO_VERSION }}
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache-dependency-path: tests/go.sum
+
+      - name: Setup Terraform ${{ env.TF_VERSION }}
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region:            ${{ secrets.AWS_REGION }}
+
+      - name: Download Go modules
+        working-directory: tests
+        run: go mod download
+
+      # Integration tests deploy, assert, then always destroy (t.Cleanup)
+      - name: Run integration tests
+        working-directory: tests
+        run: |
+          go test -v -timeout 60m \
+            -run TestDevEnvironment \
+            ./integration/... 2>&1 | tee integration_test_results.txt
+        env:
+          # Terratest uses these to connect to the right account
+          AWS_DEFAULT_REGION: ${{ secrets.AWS_REGION }}
+
+      - name: Upload integration test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: integration-test-results-${{ github.sha }}
+          retention-days: 30
+          path: tests/integration_test_results.txt
+
+  # JOB 4 — Test result summary (posts to PR as a comment)
+  test-summary:
+    name: " Test Summary"
+    runs-on: ubuntu-latest
+    needs: [unit-tests, opa-regression-tests]
+    if: always() && github.event_name == 'pull_request'
+
+    permissions:
+      pull-requests: write
+
+    steps:
+      - name: Download unit test results
+        uses: actions/download-artifact@v4
+        with:
+          name: unit-test-results-${{ github.sha }}
+          path: results/unit
+
+      - name: Download OPA test results
+        uses: actions/download-artifact@v4
+        with:
+          name: opa-test-results-${{ github.sha }}
+          path: results/opa
+
+      - name: Post test summary as PR comment
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const readSafe = (p) => { 
+                try { 
+                    return fs.readFileSync(p, 'utf8').slice(0, 20000); 
+                } catch { 
+                    return '(no output)'; 
+                } 
+            };
+
+            const vpc  = readSafe('results/unit/vpc_test_results.txt');
+            const ec2  = readSafe('results/unit/ec2_test_results.txt');
+            const rds  = readSafe('results/unit/rds_test_results.txt');
+            const opa  = readSafe('results/opa/opa_test_results.txt');
+
+            const passed = (text) => text.includes('PASS') && !text.includes('FAIL') ? '✅' : '❌';
+
+            const body = [
+                '## Infrastructure Test Results',
+                '',
+                `| Suite | Status |`,
+                `|---|---|`,
+                `| VPC Module Unit Tests | ${passed(vpc)} |`,
+                `| EC2 Module Unit Tests | ${passed(ec2)} |`,
+                `| RDS Module Unit Tests | ${passed(rds)} |`,
+                `| OPA Policy Regression Tests | ${passed(opa)} |`,
+                '',
+                '<details><summary>VPC Tests</summary>\n\n```\n' + vpc + '\n```\n</details>',
+                '<details><summary>EC2 Tests</summary>\n\n```\n' + ec2 + '\n```\n</details>',
+                '<details><summary>RDS Tests</summary>\n\n```\n' + rds + '\n```\n</details>',
+                '<details><summary>OPA Tests</summary>\n\n```\n' + opa + '\n```\n</details>',
+            ].join('\n');
+
+            github.rest.issues.createComment({
+                issue_number: context.issue.number,
+                owner: context.repo.owner,
+                repo:  context.repo.repo,
+                body,
+            });
