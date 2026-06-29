@@ -1,5 +1,5 @@
 aws_region           = "eu-west-2"
-project_name         = "adam-zahi"
+project_name         = "iac"
 environment          = "staging"
 
 # Slightly larger CIDR space, no overlap with dev
