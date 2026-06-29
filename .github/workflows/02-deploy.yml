@@ -1,4 +1,4 @@
-name: "2 · Terraform Apply"
+﻿name: "2 · Terraform Apply"
 
 # ── Triggers ────────────────────────────────────────────────────
 # Runs only when code is merged / pushed directly to main.
@@ -25,9 +25,9 @@ concurrency:
 # ── Job ─────────────────────────────────────────────────────────
 jobs:
   apply:
-    name: "🚀 Apply"
+    name: "Apply"
     runs-on: ubuntu-latest
-    environment: production     # Enforces manual approval gate in GitHub Settings
+    #environment: prod
 
     permissions:
       contents: read

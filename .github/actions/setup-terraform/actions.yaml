@@ -17,6 +17,7 @@ inputs:
   aws-region:
     description: "AWS Region"
     required: true
+    default: "eu-west-2"
   lock-timeout:
     description: "DynamoDB state-lock timeout (e.g. 60s)"
     required: false

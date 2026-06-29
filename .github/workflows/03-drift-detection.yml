@@ -4,9 +4,9 @@ name: "3 · Drift Detection"
 # US 3.2: "Un job CI/CD s'exécute quotidiennement pour vérifier la dérive."
 on:
   schedule:
-    - cron: "0 6 * * *"      # Every day at 06:00 UTC
+    - cron: "0 */2 * * *"
 
-  workflow_dispatch:           # Also triggerable on demand from the Actions tab
+  workflow_dispatch: # Also triggerable on demand from the Actions tab
     inputs:
       environment:
         description: "Environment to check (dev | staging | prod)"
@@ -20,18 +20,18 @@ on:
 
 # ── Shared constants ────────────────────────────────────────────
 env:
-  TF_VERSION:     "1.9.8"
+  TF_VERSION: "1.9.8"
   TF_WORKING_DIR: environments/dev
 
 # ── Job ─────────────────────────────────────────────────────────
 jobs:
   drift-detection:
-    name: "📡 Drift Detection"
+    name: "Drift Detection"
     runs-on: ubuntu-latest
 
     permissions:
       contents: read
-      issues: write       # Required to open a GitHub Issue on drift
+      issues: write # Required to open a GitHub Issue on drift
 
     defaults:
       run:
@@ -45,10 +45,10 @@ jobs:
       - name: Setup Terraform & AWS
         uses: ./.github/actions/setup-terraform
         with:
-          terraform-version:    ${{ env.TF_VERSION }}
-          aws-access-key-id:    ${{ secrets.AWS_ACCESS_KEY_ID }}
+          terraform-version: ${{ env.TF_VERSION }}
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-region:           ${{ secrets.AWS_REGION }}
+          aws-region: ${{ secrets.AWS_REGION }}
 
       # ── Drift check ────────────────────────────────────────────
       # -detailed-exitcode: 0 = no changes, 1 = error, 2 = drift detected
@@ -62,7 +62,7 @@ jobs:
             -detailed-exitcode \
             -no-color 2>&1 | tee drift_output.txt
           echo "exit_code=$?" >> $GITHUB_OUTPUT
-        continue-on-error: true     # Let subsequent steps handle the exit code
+        continue-on-error: true # Let subsequent steps handle the exit code
 
       # ── Alerting: GitHub Issue ──────────────────────────────────
       # US 3.2: "Une alerte est envoyée si une dérive est détectée."
@@ -76,7 +76,7 @@ jobs:
             await github.rest.issues.create({
               owner: context.repo.owner,
               repo:  context.repo.repo,
-              title: `🚨 Infrastructure Drift Detected – ${new Date().toISOString().split('T')[0]}`,
+              title: `Infrastructure Drift Detected – ${new Date().toISOString().split('T')[0]}`,
               labels: ['drift', 'infrastructure', 'alert'],
               body: [
                 '## ⚠️ Drift Detected',
@@ -114,7 +114,7 @@ jobs:
               }]
             }
         env:
-          SLACK_WEBHOOK_URL:  ${{ secrets.SLACK_WEBHOOK }}
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK }}
           SLACK_WEBHOOK_TYPE: INCOMING_WEBHOOK
 
       # ── Upload report for audit trail ──────────────────────────
