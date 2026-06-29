@@ -67,12 +67,9 @@ resource "aws_security_group" "ec2" {
   }
 }
 
-data "aws_ssm_parameter" "al2023" {
-  name = "/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64"
-}
 
 resource "aws_instance" "main" {
-  ami                         = var.ami_id != null ? var.ami_id : data.aws_ssm_parameter.al2023.value
+  ami                         = var.ami_id
   instance_type               = var.instance_type
   subnet_id                   = var.subnet_id
   vpc_security_group_ids      = [aws_security_group.ec2.id]
