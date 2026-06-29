@@ -59,15 +59,6 @@ Resources:
           CidrIp: "0.0.0.0/0"
           Description: "Allow HTTPS from anywhere"
 
-        # Allow SSH from anywhere (port 22)
-        # NOTE: In production, restrict this to my IP: e.g. "203.0.113.0/32"
-        # This matches the OPA policy check in policies/ssh_open.rego
-        - IpProtocol: tcp
-          FromPort: 22
-          ToPort: 22
-          CidrIp: "0.0.0.0/0"
-          Description: "Allow SSH - restrict to your IP in production!"
-
       # OUTBOUND RULES - what traffic is allowed OUT
       SecurityGroupEgress:
         - IpProtocol: -1        # -1 means "all protocols"
@@ -87,7 +78,7 @@ Resources:
       ImageId: !Ref AmiId
       KeyName: !Ref KeyName
       SubnetId:
-        Fn::ImportValue: !Sub "${ProjectName}-${Environment}-PublicSubnet1Id"
+        Fn::ImportValue: !Sub "${ProjectName}-${Environment}-PrivateSubnet1Id"
       SecurityGroupIds:
         - !Ref EC2SecurityGroup
       UserData:
