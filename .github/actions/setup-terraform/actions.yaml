@@ -1,47 +1,86 @@
 name: "Setup Terraform & AWS"
 description: >
-  Composite action that installs a pinned Terraform version and
-  configures AWS credentials. Used by all three CI/CD workflows so
-  the setup logic lives in exactly one place.
+  Composite action that installs a pinned Terraform version, configures
+  AWS credentials from repository secrets, and runs terraform init.
+  Used by every CI/CD workflow so setup logic lives in one place.
 
+# ─────────────────────────────────────────────────────────────────
+# INPUTS
+# ─────────────────────────────────────────────────────────────────
 inputs:
+
   terraform-version:
-    description: "Terraform version to install"
+    description: "Terraform version to install (e.g. 1.9.8)"
     required: true
+
   aws-access-key-id:
-    description: "AWS Access Key ID"
+    description: "AWS Access Key ID (from repository secrets)"
     required: true
+
   aws-secret-access-key:
-    description: "AWS Secret Access Key"
+    description: "AWS Secret Access Key (from repository secrets)"
     required: true
+
   aws-region:
-    description: "AWS Region"
+    description: "AWS region to deploy into"
     required: true
     default: "eu-west-2"
+
+  working-directory:
+    description: >
+      Path to the Terraform environment directory where terraform init
+      should run. Callers must pass this explicitly so the action works
+      for dev, staging, and prod.
+      Example: environments/dev
+    required: true
+    # No default — callers must be deliberate about which environment
+    # they are initialising. Leaving this blank causes a clear error
+    # rather than silently initialising the wrong workspace.
+
   lock-timeout:
-    description: "DynamoDB state-lock timeout (e.g. 60s)"
+    description: >
+      DynamoDB state-lock wait timeout passed to terraform init and plan.
+      Use a shorter value on PRs (60s) and longer on apply (120s).
     required: false
     default: "60s"
 
+# ─────────────────────────────────────────────────────────────────
+# STEPS
+# ─────────────────────────────────────────────────────────────────
 runs:
   using: "composite"
   steps:
-    - name: Setup Terraform ${{ inputs.terraform-version }}
+
+    # 1. Install the pinned Terraform binary.
+    #    terraform_wrapper: true preserves exit codes so that
+    #    `terraform plan -detailed-exitcode` works correctly in
+    #    the drift-detection workflow.
+    - name: "Install Terraform ${{ inputs.terraform-version }}"
       uses: hashicorp/setup-terraform@v3
       with:
         terraform_version: ${{ inputs.terraform-version }}
-        terraform_wrapper: true       # Preserves exit codes for plan / apply
+        terraform_wrapper: true
 
-    - name: Configure AWS credentials
+    # 2. Configure short-lived AWS credentials from repository secrets.
+    #    The credentials are injected as environment variables
+    #    (AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_DEFAULT_REGION)
+    #    and are scoped to the lifetime of this workflow run only.
+    - name: "Configure AWS credentials"
       uses: aws-actions/configure-aws-credentials@v4
       with:
-        aws-access-key-id:     ${{ inputs.aws-access-key-id }}
+        aws-access-key-id: ${{ inputs.aws-access-key-id }}
         aws-secret-access-key: ${{ inputs.aws-secret-access-key }}
-        aws-region:            ${{ inputs.aws-region }}
+        aws-region: ${{ inputs.aws-region }}
 
-    - name: Terraform Init
+    # 3. Run terraform init in the correct environment directory.
+    #    The working-directory is provided by the caller — this is the
+    #    fix for the original bug where it was hard-coded to environments/dev,
+    #    making the action unusable for staging and prod.
+    - name: "Terraform Init (${{ inputs.working-directory }})"
       shell: bash
-      working-directory: environments/dev
+      working-directory: ${{ inputs.working-directory }}
       run: terraform init -input=false
       env:
+        # Pass lock-timeout to init so it waits if the state is briefly locked
+        # by a concurrent workflow (e.g. drift detection running in parallel).
         TF_CLI_ARGS_init: "-lock-timeout=${{ inputs.lock-timeout }}"

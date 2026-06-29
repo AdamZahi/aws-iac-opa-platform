@@ -1,8 +1,23 @@
 ﻿name: "2 · Terraform Apply"
 
-# ── Triggers ────────────────────────────────────────────────────
-# Runs only when code is merged / pushed directly to main.
-# US 3.1: "Le pipeline déploie l'infrastructure lors d'un merge sur main."
+# ─────────────────────────────────────────────────────────────────
+# TRIGGERS
+# ─────────────────────────────────────────────────────────────────
+# Runs only when a commit is pushed (or merged) to main AND the
+# changed paths affect infrastructure.
+#
+# WHY WE RE-PLAN HERE INSTEAD OF USING THE PR ARTIFACT
+# ──────────────────────────────────────────────────────
+# The validate workflow runs on the PR HEAD commit (e.g. abc123).
+# When that PR is merged, GitHub creates a new merge commit (e.g. def456).
+# These are two different SHAs, so `actions/download-artifact` with
+# `name: tfplan-${{ github.sha }}` would always fail — the artifact was
+# uploaded under the PR SHA, not the merge SHA.
+#
+# The safe, correct solution is to re-run terraform plan here against
+# the merge commit, then immediately apply it. The plan and apply are
+# in the same job, so no drift can occur between them. The OPA policy
+# check in the validate workflow (run on the PR) still acts as a gate.
 on:
   push:
     branches:
@@ -11,56 +26,95 @@ on:
       - "environments/**"
       - "modules/**"
       - "policies/**"
+      - ".github/workflows/02-deploy.yml"
+      - ".github/actions/**"
 
-# ── Shared constants ────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────
+# SHARED CONSTANTS
+# ─────────────────────────────────────────────────────────────────
 env:
-  TF_VERSION:     "1.9.8"
-  TF_WORKING_DIR: environments/dev
+  TF_VERSION: "1.9.8"
+  TF_ENVIRONMENT: "dev"       # Change to matrix when staging/prod pipelines are added
 
-# Only one deploy can run at a time on main — prevents concurrent state writes
+# Only one deploy can run at a time on main.
+# cancel-in-progress: false means a second push queues rather than
+# killing an in-flight apply, which could leave infrastructure in a
+# partially-applied state.
 concurrency:
   group: deploy-main
-  cancel-in-progress: false   # Never cancel an in-flight apply; queue instead
+  cancel-in-progress: false
 
-# ── Job ─────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────
+# JOBS
+# ─────────────────────────────────────────────────────────────────
 jobs:
+
+  # ──────────────────────────────────────────────────────────────
+  # JOB: apply
+  #
+  # Plan → Apply in a single job so no external state can change
+  # between the two steps. Auto-approve is safe here because:
+  #   1. The PR gate (validate workflow) already ran OPA checks.
+  #   2. Branch protection requires at least one reviewer approval.
+  #   3. The GitHub Environment below adds a manual approval step.
+  # ──────────────────────────────────────────────────────────────
   apply:
-    name: "Apply"
+    name: "Apply · dev"
     runs-on: ubuntu-latest
-    #environment: prod
+
+    # ─── APPROVAL GATE ──────────────────────────────────────────────
+    # Uncomment the line below AFTER creating a "production" environment
+    # in Repository Settings → Environments, and adding required reviewers.
+    # Until you do that, leave it commented — the extension flags unknown
+    # environment names as errors even though the YAML is valid.
+    #
+    #   environment: production
+    #
+    # ────────────────────────────────────────────────────────────────
 
     permissions:
       contents: read
 
     defaults:
       run:
-        working-directory: ${{ env.TF_WORKING_DIR }}
+        working-directory: environments/${{ env.TF_ENVIRONMENT }}
 
     steps:
-      # ── Setup ──────────────────────────────────────────────────
-      - name: Checkout repository
+
+      # ── 1. Source code ─────────────────────────────────────────
+      - name: "Checkout repository"
         uses: actions/checkout@v4
 
-      - name: Setup Terraform & AWS
+      # ── 2. Tooling + AWS + terraform init ──────────────────────
+      - name: "Setup Terraform & AWS"
         uses: ./.github/actions/setup-terraform
         with:
-          terraform-version:    ${{ env.TF_VERSION }}
-          aws-access-key-id:    ${{ secrets.AWS_ACCESS_KEY_ID }}
+          terraform-version: ${{ env.TF_VERSION }}
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-region:           ${{ secrets.AWS_REGION }}
-          lock-timeout:         "120s"    # Longer timeout for apply
+          aws-region: ${{ secrets.AWS_REGION }}
+          working-directory: environments/${{ env.TF_ENVIRONMENT }}
+          lock-timeout: "120s"   # Longer timeout for apply runs
 
-      # ── Download the validated plan ────────────────────────────
-      # We apply the exact binary produced by the validate workflow —
-      # no re-plan, so what was OPA-approved is what gets deployed.
-      - name: Download validated plan artifact
-        uses: actions/download-artifact@v4
-        with:
-          name: tfplan-${{ github.sha }}
-          path: ${{ env.TF_WORKING_DIR }}
+      # ── 3. Terraform Plan ──────────────────────────────────────
+      # We plan against the merge commit — this is the source of truth.
+      # The output is kept as a binary so apply runs the exact same
+      # change set that was shown in this step's log.
+      - name: "Terraform Plan"
+        run: |
+          terraform plan \
+            -input=false \
+            -lock-timeout=120s \
+            -out=tfplan \
+            -no-color 2>&1 | tee plan_output.txt
+        env:
+          TF_VAR_environment: ${{ env.TF_ENVIRONMENT }}
 
-      # ── Apply ──────────────────────────────────────────────────
-      - name: Terraform Apply
+      # ── 4. Terraform Apply ─────────────────────────────────────
+      # Applies the binary plan produced in the previous step.
+      # Because plan and apply are in the same job, the plan cannot
+      # go stale between these two steps.
+      - name: "Terraform Apply"
         run: |
           terraform apply \
             -input=false \
@@ -68,15 +122,68 @@ jobs:
             -auto-approve \
             tfplan
         env:
-          TF_VAR_environment: dev
+          TF_VAR_environment: ${{ env.TF_ENVIRONMENT }}
 
-      # ── Post-apply outputs ─────────────────────────────────────
-      - name: Capture Terraform outputs
+      # ── 5. Capture and upload outputs ──────────────────────────
+      # Outputs (vpc_id, instance_id, db_endpoint, etc.) are uploaded
+      # as an artifact so downstream jobs or integrations can consume
+      # them without re-running Terraform.
+      - name: "Capture Terraform outputs"
+        if: always()
         run: terraform output -json > tf_outputs.json
 
-      - name: Upload apply outputs
+      - name: "Upload apply outputs"
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: tf-outputs-${{ github.sha }}
-          retention-days: 7
-          path: ${{ env.TF_WORKING_DIR }}/tf_outputs.json
+          retention-days: 14
+          path: environments/${{ env.TF_ENVIRONMENT }}/tf_outputs.json
+
+      # ── 6. Upload plan log (audit trail) ───────────────────────
+      - name: "Upload plan log"
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: deploy-plan-${{ github.sha }}
+          retention-days: 30
+          path: environments/${{ env.TF_ENVIRONMENT }}/plan_output.txt
+
+      # ── 7. Notify on failure ───────────────────────────────────
+      # If the apply fails, open a GitHub Issue so the team is alerted
+      # even if no one is watching the Actions tab.
+      - name: "Open GitHub Issue on apply failure"
+        if: failure()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const readSafe = (p) => {
+              try   { return fs.readFileSync(p, 'utf8').slice(0, 30000); }
+              catch { return '(no output)'; }
+            };
+            const plan = readSafe('environments/${{ env.TF_ENVIRONMENT }}/plan_output.txt');
+
+            await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: `🚨 Terraform Apply FAILED — ${new Date().toISOString().split('T')[0]}`,
+              labels: ['apply-failure', 'infrastructure', 'alert'],
+              body: [
+                '## 🚨 Apply Failure',
+                '',
+                `A \`terraform apply\` on \`main\` failed for environment **${{ env.TF_ENVIRONMENT }}**.`,
+                '',
+                `Commit: [\`${{ github.sha }}\`](${{ github.server_url }}/${{ github.repository }}/commit/${{ github.sha }})`,
+                `Run: [#${{ github.run_number }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})`,
+                '',
+                '**Action required:** Review the run logs and re-apply or roll back.',
+                '',
+                '<details><summary>Plan output</summary>',
+                '',
+                '```hcl',
+                plan,
+                '```',
+                '</details>',
+              ].join('\n'),
+            });

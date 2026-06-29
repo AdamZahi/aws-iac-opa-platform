@@ -1,8 +1,11 @@
 name: "1 · Terraform Validate & OPA"
 
-# ── Triggers ────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────
+# TRIGGERS
+# ─────────────────────────────────────────────────────────────────
 # Runs on every Pull Request targeting main.
-# Only watches paths that affect infrastructure or policies.
+# Path filters ensure we only run when IaC or policy files change,
+# not on documentation-only edits.
 on:
   pull_request:
     branches:
@@ -11,54 +14,91 @@ on:
       - "environments/**"
       - "modules/**"
       - "policies/**"
+      - ".github/workflows/01-validate.yml"
+      - ".github/actions/**"
 
-# ── Shared constants ────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────
+# SHARED CONSTANTS
+# ─────────────────────────────────────────────────────────────────
 env:
-  TF_VERSION:       "1.9.8"
+  TF_VERSION: "1.9.8"
   CONFTEST_VERSION: "0.63.0"
-  TF_WORKING_DIR:   environments/dev
 
-# Cancel duplicate runs on the same PR to avoid state-lock races (Bug 1)
+# Cancel any duplicate run triggered by a force-push to the same PR branch.
+# This prevents two concurrent runs from fighting over the DynamoDB state lock.
 concurrency:
   group: validate-${{ github.ref }}
   cancel-in-progress: true
 
-# ── Job ─────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────
+# JOBS
+# ─────────────────────────────────────────────────────────────────
 jobs:
+
+  # ──────────────────────────────────────────────────────────────
+  # JOB: validate
+  #
+  # Runs terraform fmt, validate, plan, and OPA/Conftest for every
+  # environment in the matrix. Using a matrix means a bad change in
+  # environments/prod is caught on the PR — not after it merges.
+  # ──────────────────────────────────────────────────────────────
   validate:
-    name: "Validate & OPA"
+    name: "Validate · ${{ matrix.environment }}"
     runs-on: ubuntu-latest
 
     permissions:
       contents: read
-      pull-requests: write    # Needed to post the plan as a PR comment
+      pull-requests: write   # Required to post the plan as a PR comment
 
+    # Run the same job steps for each environment independently.
+    # If dev passes but prod fails, the PR is still blocked.
+    strategy:
+      fail-fast: false        # Show failures for ALL environments, not just the first
+      matrix:
+        environment: [dev, staging, prod]
+
+    # Every `run:` step below executes inside the correct environment folder.
     defaults:
       run:
-        working-directory: ${{ env.TF_WORKING_DIR }}
+        working-directory: environments/${{ matrix.environment }}
 
     steps:
-      # ── Setup ──────────────────────────────────────────────────
-      - name: Checkout repository
+
+      # ── 1. Source code ─────────────────────────────────────────
+      - name: "Checkout repository"
         uses: actions/checkout@v4
 
-      - name: Setup Terraform & AWS
+      # ── 2. Tooling + AWS + terraform init ──────────────────────
+      # The composite action now accepts `working-directory` so it
+      # initialises the right environment instead of always using dev.
+      - name: "Setup Terraform & AWS"
         uses: ./.github/actions/setup-terraform
         with:
-          terraform-version:    ${{ env.TF_VERSION }}
-          aws-access-key-id:    ${{ secrets.AWS_ACCESS_KEY_ID }}
+          terraform-version: ${{ env.TF_VERSION }}
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-region:           ${{ secrets.AWS_REGION }}
+          aws-region: ${{ secrets.AWS_REGION }}
+          working-directory: environments/${{ matrix.environment }}
+          lock-timeout: "60s"
 
-      # ── Static checks ──────────────────────────────────────────
-      - name: Terraform Format Check
+      # ── 3. Format check ────────────────────────────────────────
+      # -recursive checks modules/ as well, not just the environment dir.
+      # Run from repo root so the -recursive flag catches everything.
+      - name: "Terraform Format Check"
+        working-directory: .
         run: terraform fmt -check -recursive
 
-      - name: Terraform Validate
+      # ── 4. Syntax + provider validation ────────────────────────
+      - name: "Terraform Validate"
         run: terraform validate -no-color
 
-      # ── Plan ───────────────────────────────────────────────────
-      - name: Terraform Plan
+      # ── 5. Terraform Plan ──────────────────────────────────────
+      # Produces a binary plan file and a human-readable text log.
+      # The binary (tfplan) is consumed by Conftest in the next step.
+      # TF_VAR_environment is passed so the `environment` variable
+      # does not need a default value in variables.tf.
+      - name: "Terraform Plan"
+        id: plan
         run: |
           terraform plan \
             -input=false \
@@ -66,55 +106,134 @@ jobs:
             -out=tfplan \
             -no-color 2>&1 | tee plan_output.txt
         env:
-          TF_VAR_environment: dev
+          TF_VAR_environment: ${{ matrix.environment }}
+        # continue-on-error so the PR comment step below always runs,
+        # even when the plan itself fails — the comment will show the error.
+        continue-on-error: true
 
-      - name: Export plan as JSON
+      # ── 6. Export plan as JSON (required by Conftest) ──────────
+      # Only runs if the plan step succeeded (exit 0 or 2).
+      - name: "Export plan as JSON"
+        if: steps.plan.outcome != 'failure'
         run: terraform show -json tfplan > tfplan.json
 
-      # ── OPA / Conftest ─────────────────────────────────────────
-      # Enforces the 3 Rego rules (US 2.1 + US 2.2).
-      # A non-zero exit code blocks the pipeline (US 3.1 acceptance criterion).
-      - name: Install Conftest ${{ env.CONFTEST_VERSION }}
+      # ── 7. Install Conftest ────────────────────────────────────
+      - name: "Install Conftest ${{ env.CONFTEST_VERSION }}"
+        if: steps.plan.outcome != 'failure'
         run: |
-          wget -q https://github.com/open-policy-agent/conftest/releases/download/v${{ env.CONFTEST_VERSION }}/conftest_${{ env.CONFTEST_VERSION }}_Linux_x86_64.tar.gz
+          wget -q \
+            https://github.com/open-policy-agent/conftest/releases/download/v${{ env.CONFTEST_VERSION }}/conftest_${{ env.CONFTEST_VERSION }}_Linux_x86_64.tar.gz
           tar xzf conftest_${{ env.CONFTEST_VERSION }}_Linux_x86_64.tar.gz
           sudo mv conftest /usr/local/bin/
+          conftest --version
 
-      - name: Run OPA Policies
+      # ── 8. Run OPA Policies ────────────────────────────────────
+      # Conftest evaluates tfplan.json against every .rego file in
+      # the policies/ directory. A non-zero exit code (policy violation)
+      # blocks the pipeline — the PR cannot be merged until it is fixed.
+      - name: "Run OPA Policies (Conftest)"
+        if: steps.plan.outcome != 'failure'
         run: |
           conftest test tfplan.json \
             --policy ../../policies \
             --output table \
             --no-color 2>&1 | tee opa_output.txt
 
-      # ── PR feedback ────────────────────────────────────────────
-      - name: Post plan + OPA results as PR comment
+      # ── 9. Post plan + OPA results as a PR comment ─────────────
+      # Runs on every attempt (success or failure) so engineers always
+      # see the plan output directly on the PR without opening workflow logs.
+      - name: "Post plan + OPA results as PR comment"
+        if: always() && github.event_name == 'pull_request'
         uses: actions/github-script@v7
         with:
           script: |
-            const fs = require('fs');
-            const plan = fs.readFileSync('${{ env.TF_WORKING_DIR }}/plan_output.txt', 'utf8').slice(0, 60000);
-            const opa  = fs.readFileSync('${{ env.TF_WORKING_DIR }}/opa_output.txt',  'utf8').slice(0, 10000);
-            github.rest.issues.createComment({
-              issue_number: context.issue.number,
+            const fs   = require('fs');
+            const env  = '${{ matrix.environment }}';
+
+            const readSafe = (p) => {
+              try   { return fs.readFileSync(p, 'utf8').slice(0, 50000); }
+              catch { return '(file not produced — see workflow logs)'; }
+            };
+
+            const plan = readSafe('environments/' + env + '/plan_output.txt');
+            const opa  = readSafe('environments/' + env + '/opa_output.txt');
+
+            const planStatus = '${{ steps.plan.outcome }}' === 'success' ? '✅' : '❌';
+
+            const body = [
+              `## ${planStatus} Terraform Plan — \`${env}\``,
+              '',
+              '<details><summary>Click to expand plan output</summary>',
+              '',
+              '```hcl',
+              plan,
+              '```',
+              '</details>',
+              '',
+              '## 🔐 OPA Policy Results',
+              '```',
+              opa,
+              '```',
+              '',
+              `> Workflow run: [#${{ github.run_number }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})`,
+            ].join('\n');
+
+            // Find and update an existing comment for this environment
+            // instead of posting a new one on every push to the PR branch.
+            const marker = `<!-- validate-${env} -->`;
+            const { data: comments } = await github.rest.issues.listComments({
               owner: context.repo.owner,
-              repo:  context.repo.repo,
-              body: [
-                '## 🏗️ Terraform Plan',
-                '```hcl', plan, '```',
-                '',
-                '## 🔐 OPA Policy Results',
-                '```', opa, '```',
-              ].join('\n'),
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
             });
 
-      # ── Artifact handoff to the deploy workflow ─────────────────
-      - name: Upload plan artifacts
+            const existing = comments.find(c => c.body.includes(marker));
+
+            if (existing) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: existing.id,
+                body: marker + '\n' + body,
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                body: marker + '\n' + body,
+              });
+            }
+
+      # ── 10. Upload plan artifacts (dev only — used by deploy) ──
+      # Only the dev plan artifact is used by the deploy workflow.
+      # Staging and prod have their own dedicated deploy pipelines
+      # (or manual promotion gates) and are validated here for safety.
+      #
+      # IMPORTANT: The artifact is named with the PR HEAD sha so the
+      # deploy workflow — which runs on the MERGE commit — re-plans
+      # from scratch instead of trying to reuse this binary plan.
+      # See 02-deploy.yml for the explanation of why re-planning on
+      # merge is the correct and safe approach.
+      - name: "Upload plan artifacts (dev)"
+        if: matrix.environment == 'dev' && steps.plan.outcome != 'failure'
         uses: actions/upload-artifact@v4
         with:
-          name: tfplan-${{ github.sha }}
-          retention-days: 1
+          name: tfplan-dev-${{ github.sha }}
+          # Keep for 3 days — long enough to merge the PR and trigger deploy.
+          retention-days: 3
           path: |
-            ${{ env.TF_WORKING_DIR }}/tfplan
-            ${{ env.TF_WORKING_DIR }}/tfplan.json
-            ${{ env.TF_WORKING_DIR }}/plan_output.txt
+            environments/dev/tfplan
+            environments/dev/tfplan.json
+            environments/dev/plan_output.txt
+
+      # ── 11. Fail the job if the plan step failed ───────────────
+      # This step exists because plan runs with continue-on-error: true
+      # (to allow the comment step to run). We must still fail the job
+      # so the PR is blocked.
+      - name: "Fail if plan failed"
+        if: steps.plan.outcome == 'failure'
+        run: |
+          echo "::error::terraform plan failed for environment '${{ matrix.environment }}'."
+          echo "Review the plan output in the PR comment and fix the error before merging."
+          exit 1

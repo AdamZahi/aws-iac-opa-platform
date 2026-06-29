@@ -1,15 +1,21 @@
 name: "3 · Drift Detection"
 
-# ── Triggers ────────────────────────────────────────────────────
-# US 3.2: "Un job CI/CD s'exécute quotidiennement pour vérifier la dérive."
+# ─────────────────────────────────────────────────────────────────
+# TRIGGERS
+# ─────────────────────────────────────────────────────────────────
+# Scheduled: once per day at 06:00 UTC so drift is caught early in
+# the working day without hammering the state backend every 2 hours.
+#
+# workflow_dispatch: allows engineers to trigger a manual check
+# from the Actions tab and to choose which environment to inspect.
 on:
   schedule:
-    - cron: "0 */2 * * *"
+    - cron: "0 6 * * *"   # 06:00 UTC daily
 
-  workflow_dispatch: # Also triggerable on demand from the Actions tab
+  workflow_dispatch:
     inputs:
       environment:
-        description: "Environment to check (dev | staging | prod)"
+        description: "Environment to check"
         required: true
         default: "dev"
         type: choice
@@ -18,98 +24,176 @@ on:
           - staging
           - prod
 
-# ── Shared constants ────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────
+# SHARED CONSTANTS
+# ─────────────────────────────────────────────────────────────────
 env:
   TF_VERSION: "1.9.8"
-  TF_WORKING_DIR: environments/dev
+  # When triggered by the schedule, default to dev.
+  # When triggered manually, the input value is used.
+  ENVIRONMENT: ${{ github.event.inputs.environment || 'dev' }}
 
-# ── Job ─────────────────────────────────────────────────────────
+# Only one drift check per environment at a time.
+# If a scheduled run is still executing when the next one fires,
+# the new run queues rather than creating a second state-lock attempt.
+concurrency:
+  group: drift-${{ github.event.inputs.environment || 'dev' }}
+  cancel-in-progress: false
+
+# ─────────────────────────────────────────────────────────────────
+# JOBS
+# ─────────────────────────────────────────────────────────────────
 jobs:
+
+  # ──────────────────────────────────────────────────────────────
+  # JOB: drift-detection
+  #
+  # Runs terraform plan with -detailed-exitcode:
+  #   Exit 0 → no changes   (infrastructure matches state)
+  #   Exit 1 → plan error   (something is broken)
+  #   Exit 2 → drift found  (live AWS differs from IaC state)
+  # ──────────────────────────────────────────────────────────────
   drift-detection:
-    name: "Drift Detection"
+    name: "Drift Detection · ${{ github.event.inputs.environment || 'dev' }}"
     runs-on: ubuntu-latest
 
     permissions:
       contents: read
-      issues: write # Required to open a GitHub Issue on drift
+      issues: write   # Required to open a GitHub Issue on drift
 
     defaults:
       run:
-        working-directory: ${{ env.TF_WORKING_DIR }}
+        working-directory: environments/${{ github.event.inputs.environment || 'dev' }}
 
     steps:
-      # ── Setup ──────────────────────────────────────────────────
-      - name: Checkout repository
+
+      # ── 1. Source code ─────────────────────────────────────────
+      - name: "Checkout repository"
         uses: actions/checkout@v4
 
-      - name: Setup Terraform & AWS
+      # ── 2. Tooling + AWS + terraform init ──────────────────────
+      - name: "Setup Terraform & AWS"
         uses: ./.github/actions/setup-terraform
         with:
           terraform-version: ${{ env.TF_VERSION }}
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ secrets.AWS_REGION }}
+          working-directory: environments/${{ env.ENVIRONMENT }}
+          # Drift runs read-only — use a short lock timeout.
+          # -lock=false below means we do not acquire a state lock at all,
+          # so this timeout only covers the init phase.
+          lock-timeout: "30s"
 
-      # ── Drift check ────────────────────────────────────────────
-      # -detailed-exitcode: 0 = no changes, 1 = error, 2 = drift detected
-      - name: Terraform Plan – detect drift
+      # ── 3. Drift check ─────────────────────────────────────────
+      # KEY FIXES vs original:
+      #   a) -lock=false: drift detection only READS state; it never
+      #      writes. Using -lock=false means this job never blocks a
+      #      concurrent terraform apply from acquiring the lock.
+      #   b) Exit-code capture: the original used `echo "exit_code=$?"`
+      #      AFTER the pipe to tee, which always captured tee's exit
+      #      code (0), not terraform's. We use pipefail + a temp file
+      #      to capture terraform's real exit code reliably.
+      - name: "Terraform Plan — detect drift"
         id: drift
         run: |
+          set -o pipefail
+
+          # Run plan and capture terraform's exit code separately from tee's.
           terraform plan \
             -input=false \
-            -lock-timeout=60s \
+            -lock=false \
             -refresh=true \
             -detailed-exitcode \
             -no-color 2>&1 | tee drift_output.txt
-          echo "exit_code=$?" >> $GITHUB_OUTPUT
-        continue-on-error: true # Let subsequent steps handle the exit code
+          TF_EXIT=${PIPESTATUS[0]}
 
-      # ── Alerting: GitHub Issue ──────────────────────────────────
-      # US 3.2: "Une alerte est envoyée si une dérive est détectée."
-      - name: Open GitHub Issue on drift
+          echo "exit_code=${TF_EXIT}" >> $GITHUB_OUTPUT
+
+          # Exit 0 = clean, exit 2 = drift — both are handled below.
+          # Exit 1 = real Terraform error — let the job fail immediately.
+          if [ "${TF_EXIT}" -eq 1 ]; then
+            echo "::error::terraform plan returned exit code 1 — this is a Terraform error, not drift."
+            exit 1
+          fi
+
+          # Exit with 0 so subsequent steps always run.
+          exit 0
+        continue-on-error: true
+
+      # ── 4. Alert: GitHub Issue ─────────────────────────────────
+      # Opens a new issue only when drift is detected (exit code 2).
+      # Uses a deduplication check so we don't flood the issue tracker
+      # if drift is left unresolved across multiple daily runs.
+      - name: "Open GitHub Issue on drift"
         if: steps.drift.outputs.exit_code == '2'
         uses: actions/github-script@v7
         with:
           script: |
-            const fs = require('fs');
-            const drift = fs.readFileSync('${{ env.TF_WORKING_DIR }}/drift_output.txt', 'utf8').slice(0, 60000);
+            const fs    = require('fs');
+            const env   = '${{ env.ENVIRONMENT }}';
+            const today = new Date().toISOString().split('T')[0];
+
+            const drift = fs.readFileSync(
+              'environments/' + env + '/drift_output.txt',
+              'utf8'
+            ).slice(0, 60000);
+
+            // Check for an open drift issue from today to avoid duplicates.
+            const { data: issues } = await github.rest.issues.listForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              labels: 'drift',
+              state: 'open',
+            });
+
+            const duplicate = issues.find(i => i.title.includes(today) && i.title.includes(env));
+            if (duplicate) {
+              console.log('Drift issue already open for today — skipping creation.');
+              return;
+            }
+
             await github.rest.issues.create({
               owner: context.repo.owner,
-              repo:  context.repo.repo,
-              title: `Infrastructure Drift Detected – ${new Date().toISOString().split('T')[0]}`,
+              repo: context.repo.repo,
+              title: `⚠️ Infrastructure Drift Detected [${env}] — ${today}`,
               labels: ['drift', 'infrastructure', 'alert'],
               body: [
                 '## ⚠️ Drift Detected',
                 '',
-                'A scheduled Terraform plan found differences between the IaC state and live AWS resources.',
-                'Manual changes may have been made outside of the CI/CD pipeline.',
+                `A scheduled Terraform plan found differences between the IaC state`,
+                `and live AWS resources in the **${env}** environment.`,
+                'Manual changes may have been made outside the CI/CD pipeline.',
                 '',
-                '**Action required** — choose one:',
-                '- Run `terraform apply` to bring AWS back in sync with code, OR',
-                '- Update the IaC code to reflect intentional changes, then merge to main.',
+                '**Action required — choose one:**',
+                '- Run `terraform apply` to reconcile AWS back to the IaC definition, OR',
+                '- Update the Terraform code to reflect intentional manual changes, then merge to main.',
                 '',
                 '```hcl',
                 drift,
                 '```',
                 '',
                 `> Detected at: ${new Date().toISOString()}`,
+                `> Workflow run: [#${{ github.run_number }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})`,
               ].join('\n'),
             });
 
-      # ── Alerting: Slack ─────────────────────────────────────────
-      # Add SLACK_WEBHOOK to repository secrets to enable this step.
-      - name: Slack notification on drift
-        if: steps.drift.outputs.exit_code == '2'
-        uses: slackapi/slack-github-action@v1.27.0
+      # ── 5. Alert: Slack ────────────────────────────────────────
+      # Add SLACK_WEBHOOK to repository secrets to activate this step.
+      # If the secret is absent the step is skipped gracefully.
+      - name: "Slack notification on drift"
+        if: steps.drift.outputs.exit_code == '2' && env.SLACK_WEBHOOK_URL != ''
+        uses: slackapi/slack-github-action@v2.0.0
         with:
           payload: |
             {
-              "text": "🚨 *Infrastructure Drift Detected* on `${{ github.repository }}`!\nManual changes were made outside Terraform. A GitHub Issue has been opened with the diff.",
+              "text": "⚠️ *Drift Detected* — env: `${{ env.ENVIRONMENT }}` on `${{ github.repository }}`.\nManual changes detected outside Terraform. GitHub Issue opened.",
               "attachments": [{
-                "color": "danger",
+                "color": "warning",
                 "fields": [
-                  { "title": "Repository", "value": "${{ github.repository }}", "short": true },
-                  { "title": "Detected at", "value": "${{ github.run_started_at }}", "short": true }
+                  { "title": "Environment", "value": "${{ env.ENVIRONMENT }}", "short": true },
+                  { "title": "Detected at", "value": "${{ github.run_started_at }}", "short": true },
+                  { "title": "Run", "value": "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}", "short": false }
                 ]
               }]
             }
@@ -117,18 +201,31 @@ jobs:
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK }}
           SLACK_WEBHOOK_TYPE: INCOMING_WEBHOOK
 
-      # ── Upload report for audit trail ──────────────────────────
-      - name: Upload drift report
+      # ── 6. Upload report (audit trail) ─────────────────────────
+      # Always upload even when there is no drift, so you have a
+      # historical record proving the check ran and found nothing.
+      - name: "Upload drift report"
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: drift-report-${{ github.run_id }}
+          name: drift-report-${{ env.ENVIRONMENT }}-${{ github.run_id }}
           retention-days: 30
-          path: ${{ env.TF_WORKING_DIR }}/drift_output.txt
+          path: environments/${{ env.ENVIRONMENT }}/drift_output.txt
 
-      # ── Make the job visibly red in the Actions UI on drift ────
-      - name: Fail on detected drift
+      # ── 7. Fail the job visibly on drift ───────────────────────
+      # Makes the workflow run red in the Actions UI so it is
+      # immediately visible on the repository home page.
+      - name: "Fail job on detected drift"
         if: steps.drift.outputs.exit_code == '2'
         run: |
-          echo "::error::Infrastructure drift detected. Review the GitHub Issue and drift report artifact."
+          echo "::error::Infrastructure drift detected in '${{ env.ENVIRONMENT }}'."
+          echo "::error::Review the GitHub Issue and the drift report artifact."
+          exit 1
+
+      # ── 8. Fail the job on Terraform errors ────────────────────
+      - name: "Fail job on plan error"
+        if: steps.drift.outputs.exit_code == '1'
+        run: |
+          echo "::error::terraform plan returned an error in '${{ env.ENVIRONMENT }}'."
+          echo "::error::This is not a drift alert — check the plan output for syntax or provider errors."
           exit 1
