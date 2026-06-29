@@ -11,14 +11,29 @@ import future.keywords.if
 OPEN_CIDRS := {"0.0.0.0/0", "::/0"}
 
 deny contains msg if {
-    resource := input.resource_changes[_]
-    resource.type == "aws_security_group"
-    rule := resource.change.after.ingress[_]
-    rule.from_port <= 22
-    rule.to_port >= 22
-    rule.cidr_blocks[_] == OPEN_CIDRS[_]
-    msg := sprintf(
-        "❌ [SSH EXPOSED] Security Group '%s' allows SSH (port 22) from the internet (%s). Restrict to a known CIDR.",
-        [resource.name, rule.cidr_blocks[_]]
-    )
+  resource := input.resource_changes[_]
+  resource.type == "aws_security_group"
+  rule := resource.change.after.ingress[_]
+  rule.from_port <= 22
+  rule.to_port >= 22
+  cidr := rule.cidr_blocks[_]
+  cidr == "0.0.0.0/0"
+  msg := sprintf(
+    "[SSH EXPOSED] Security Group '%s' allows SSH from %s",
+    [resource.name, cidr]
+  )
+}
+
+deny contains msg if {
+  resource := input.resource_changes[_]
+  resource.type == "aws_security_group"
+  rule := resource.change.after.ingress[_]
+  rule.from_port <= 22
+  rule.to_port >= 22
+  cidr := rule.ipv6_cidr_blocks[_]
+  cidr == "::/0"
+  msg := sprintf(
+    "[SSH EXPOSED] Security Group '%s' allows SSH from %s (IPv6)",
+    [resource.name, cidr]
+  )
 }

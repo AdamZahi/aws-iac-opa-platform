@@ -9,14 +9,10 @@ package terraform.security
 import future.keywords.contains
 import future.keywords.if
 
-FORBIDDEN_ACLS := {"public-read", "public-read-write", "authenticated-read"}
-
 deny contains msg if {
-    resource := input.resource_changes[_]
-    resource.type == "aws_s3_bucket"
-    resource.change.after.acl == FORBIDDEN_ACLS[_]
-    msg := sprintf(
-        "[S3 PUBLIC ACL] Bucket '%s' uses forbidden ACL '%s'. S3 buckets must be private.",
-        [resource.name, resource.change.after.acl]
-    )
+  resource := input.resource_changes[_]
+  resource.type == "aws_s3_bucket_public_access_block"
+  after := resource.change.after
+  not after.block_public_acls
+  msg := sprintf("[S3 PUBLIC] Bucket '%s' does not block public ACLs.", [resource.name])
 }
