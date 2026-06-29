@@ -5,5 +5,3 @@
 *.tfstate.backup
 
 crash.log
-
-/environments/*/terraform.tfvars
