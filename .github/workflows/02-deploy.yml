@@ -34,7 +34,7 @@ on:
 # ─────────────────────────────────────────────────────────────────
 env:
   TF_VERSION: "1.9.8"
-  TF_ENVIRONMENT: "staging"       # Change to matrix when staging/prod pipelines are added
+  TF_ENVIRONMENT: "dev"       # Change to matrix when staging/prod pipelines are added
 
 # Only one deploy can run at a time on main.
 # cancel-in-progress: false means a second push queues rather than
@@ -59,7 +59,7 @@ jobs:
   #   3. The GitHub Environment below adds a manual approval step.
   # ──────────────────────────────────────────────────────────────
   apply:
-    name: "Apply · staging"
+    name: "Apply to dev"
     runs-on: ubuntu-latest
 
     # ─── APPROVAL GATE ──────────────────────────────────────────────
