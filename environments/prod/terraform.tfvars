@@ -1,5 +1,5 @@
 aws_region           = "eu-west-2"
-project_name         = "iac"
+project_name         = "pipeline"
 environment          = "prod"
 
 # Separate CIDR, no overlap with dev or staging
