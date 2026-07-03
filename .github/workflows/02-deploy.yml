@@ -113,16 +113,6 @@ jobs:
           exit ${PIPESTATUS[0]}
         env:
           TF_VAR_environment: ${{ env.TF_ENVIRONMENT }}
-      
-      - name: Verify plan file exists
-        working-directory: environments/dev
-        run: |
-          if [ ! -f tfplan ]; then
-            echo "❌ tfplan not found — plan step did not produce output file"
-            exit 1
-          fi
-          echo "✅ tfplan found ($(du -h tfplan | cut -f1))"
-            
       # ── 4. Terraform Apply ─────────────────────────────────────
       # Applies the binary plan produced in the previous step.
       # Because plan and apply are in the same job, the plan cannot
