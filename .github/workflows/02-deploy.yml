@@ -105,7 +105,8 @@ jobs:
         run: |
           terraform plan \
             -input=false \
-            -lock-timeout=120s \
+            -lock=false \
+            # -lock-timeout=120s \
             -out=tfplan \
             -no-color 2>&1 | tee plan_output.txt
         env:
