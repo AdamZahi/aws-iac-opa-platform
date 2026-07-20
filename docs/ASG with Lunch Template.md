@@ -1,4 +1,4 @@
-# US 6.1 — Auto Scaling Group with Launch Template
+# US 6 — Auto Scaling Group with Launch Template
 
 **Epic:** High Availability and Scalability
 **Status:** Implemented
